@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inventory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Inventory</h1>
+    <div class="stats">
+      <div><span id="stat-items">0</span><label>Parts</label></div>
+      <div><span id="stat-units">0</span><label>Units</label></div>
+      <div><span id="stat-value">$0.00</span><label>Total value</label></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search by P/N or description…" autocomplete="off" autofocus>
+      <button id="add-btn" class="primary">+ Add item</button>
+      <a id="export-btn" class="button" href="/api/export.csv">Export CSV</a>
+      <label class="button">Import CSV<input id="import-file" type="file" accept=".csv,text/csv" hidden></label>
+    </div>
+
+    <div id="message" role="status" hidden></div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-sort="part_number">P/N</th>
+            <th data-sort="description">Description</th>
+            <th data-sort="quantity" class="num">Qty</th>
+            <th data-sort="unit_value" class="num">Unit value</th>
+            <th data-sort="total_value" class="num">Total value</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" hidden>No items found.</p>
+    </div>
+  </main>
+
+  <dialog id="item-dialog">
+    <form id="item-form" method="dialog">
+      <h2 id="dialog-title">Add item</h2>
+      <label>P/N <input name="part_number" required maxlength="100"></label>
+      <label>Description <textarea name="description" rows="3"></textarea></label>
+      <div class="row">
+        <label>Quantity <input name="quantity" type="number" min="0" step="1" value="0" required></label>
+        <label>Unit value ($) <input name="unit_value" type="number" min="0" step="0.01" value="0" required></label>
+      </div>
+      <p id="form-error" class="error" hidden></p>
+      <div class="actions">
+        <button type="button" id="cancel-btn">Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
