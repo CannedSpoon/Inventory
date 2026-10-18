@@ -47,6 +47,9 @@ header {
   background: var(--panel);
 }
 h1 { margin: 0; font-size: 22px; }
+.brand { display: flex; align-items: center; gap: 14px; }
+#scan-btn { padding: 7px 16px; font-weight: 600; }
+#scan-btn::before { content: "▦ "; }
 .stats { display: flex; gap: 28px; }
 .stats div { display: flex; flex-direction: column; align-items: flex-end; }
 .stats span { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -134,6 +137,17 @@ a { color: var(--accent); }
   font-size: 13px;
   white-space: nowrap;
 }
+.tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+td.code, .code-chip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.code-chip { font-size: 14px; font-weight: 500; padding: 2px 8px; border-radius: 4px; background: var(--chip); vertical-align: middle; }
 .badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; vertical-align: middle; }
 .badge.open { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
 .badge.closed { background: var(--chip); color: var(--muted); }
@@ -152,6 +166,7 @@ dialog {
   color: var(--text);
 }
 dialog.wide { width: min(980px, calc(100vw - 32px)); }
+dialog.medium { width: min(680px, calc(100vw - 32px)); }
 dialog::backdrop { background: rgba(0, 0, 0, .45); }
 dialog form { display: flex; flex-direction: column; gap: 12px; padding: 20px; }
 dialog h2 { margin: 0 0 4px; font-size: 19px; }
@@ -161,6 +176,27 @@ dialog form input, dialog form select, dialog form textarea { color: var(--text)
 dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .subject { display: flex; align-items: center; gap: 10px; margin: 0; padding: 8px 10px; background: var(--chip); border-radius: 8px; }
 .subject b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 4px; }
+
+.label-list { display: flex; flex-direction: column; gap: 8px; max-height: 42vh; overflow: auto; padding: 4px; }
+.label-item { display: flex !important; flex-direction: row !important; align-items: center; gap: 10px; }
+.label-item canvas {
+  height: 72px;
+  max-width: 100%;
+  object-fit: contain;
+  object-position: left;
+  image-rendering: pixelated;
+  border: 1px solid #c8ccd2;
+  border-radius: 3px;
+  background: #fff;
+}
+#print-area { display: none; }
+@media print {
+  body { background: #fff; }
+  body > :not(#print-area) { display: none !important; }
+  #print-area { display: block; }
+  .print-label { display: flex; align-items: center; break-after: page; overflow: hidden; }
+  .print-label img { display: block; image-rendering: pixelated; }
+}
 
 .detail { position: relative; padding: 22px; }
 .detail .close {
@@ -185,6 +221,7 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
 
 @media (max-width: 640px) {
   header { padding: 14px 16px 10px; }
+  .brand { width: 100%; justify-content: space-between; }
   .stats { gap: 14px; }
   .stats span { font-size: 16px; }
   .detail { padding: 16px; }
@@ -192,27 +229,29 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top
   .photo { margin-top: 30px; }
   .photo img, .no-photo { width: 100%; height: auto; aspect-ratio: 4 / 3; }
 
-  /* Parts list becomes cards on phones */
-  #view-parts thead { display: none; }
-  #view-parts table, #view-parts tbody { display: block; }
-  #view-parts tbody tr {
+  /* Parts lists become cards on phones */
+  :is(#view-parts, .cards) thead { display: none; }
+  :is(#view-parts, .cards) table, :is(#view-parts, .cards) tbody, table.cards, .cards tbody { display: block; }
+  :is(#view-parts, .cards) tbody tr {
     display: grid;
     grid-template-columns: 48px 1fr auto;
-    grid-template-areas: "thumb pn qty" "thumb desc desc" "thumb chips chips" "thumb total actions";
+    grid-template-areas: "thumb pn qty" "thumb desc desc" "thumb cat cat" "thumb chips chips" "thumb total actions";
     gap: 4px 10px;
     padding: 12px;
     border-bottom: 1px solid var(--border);
   }
-  #view-parts tbody tr:last-child { border-bottom: none; }
-  #view-parts td { border: none; padding: 0; min-width: 0; }
-  #view-parts td.thumb-col { grid-area: thumb; }
-  #view-parts td.pn { grid-area: pn; white-space: normal; overflow-wrap: anywhere; }
-  #view-parts td.qty { grid-area: qty; }
-  #view-parts td.qty::before { content: "Qty "; color: var(--muted); font-weight: 400; font-size: 13px; }
-  #view-parts td.desc { grid-area: desc; }
-  #view-parts td.chips { grid-area: chips; }
-  #view-parts td.chips:empty { display: none; }
-  #view-parts td.unit { display: none; }
-  #view-parts td.total { grid-area: total; text-align: left; align-self: center; color: var(--muted); }
-  #view-parts td.actions { grid-area: actions; }
+  :is(#view-parts, .cards) tbody tr:last-child { border-bottom: none; }
+  :is(#view-parts, .cards) td { border: none; padding: 0; min-width: 0; }
+  :is(#view-parts, .cards) td.thumb-col { grid-area: thumb; }
+  :is(#view-parts, .cards) td.pn { grid-area: pn; white-space: normal; overflow-wrap: anywhere; }
+  :is(#view-parts, .cards) td.qty { grid-area: qty; }
+  :is(#view-parts, .cards) td.qty::before { content: "Qty "; color: var(--muted); font-weight: 400; font-size: 13px; }
+  :is(#view-parts, .cards) td.desc { grid-area: desc; }
+  :is(#view-parts, .cards) td.chips { grid-area: chips; }
+  :is(#view-parts, .cards) td.cat { grid-area: cat; }
+  :is(#view-parts, .cards) td.cat:empty { display: none; }
+  :is(#view-parts, .cards) td.chips:empty { display: none; }
+  :is(#view-parts, .cards) td.unit { display: none; }
+  :is(#view-parts, .cards) td.total { grid-area: total; text-align: left; align-self: center; color: var(--muted); }
+  :is(#view-parts, .cards) td.actions { grid-area: actions; }
 }

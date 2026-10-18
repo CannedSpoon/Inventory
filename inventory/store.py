@@ -5,19 +5,22 @@ movements table, and parts booked out to a job are movements linked to that job,
 so a job's parts list and value are derived from its movements.
 """
 
+import re
 import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import unquote
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_LOCATION = "Main"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 SORTABLE = {
     "part_number": "part_number COLLATE NOCASE",
     "description": "description COLLATE NOCASE",
+    "category": "category COLLATE NOCASE",
     "quantity": "quantity",
     "unit_value": "unit_value",
     "total_value": "quantity * unit_value",
@@ -101,6 +104,17 @@ INSERT INTO movements (kind, item_id, part_number, description, location_id, loc
 DROP TABLE legacy_qty;
 """
 
+# Version 3 adds part categories and a scannable code for each location.
+MIGRATE_V3 = """
+ALTER TABLE items ADD COLUMN category TEXT NOT NULL DEFAULT '';
+CREATE INDEX items_category ON items(category COLLATE NOCASE);
+ALTER TABLE locations ADD COLUMN code TEXT;
+UPDATE locations SET code = printf('LOC-%04d', id);
+CREATE UNIQUE INDEX locations_code ON locations(code COLLATE NOCASE);
+"""
+
+CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,39}$")
+
 IMAGE_TYPES = [
     (b"\xff\xd8\xff", "jpg"),
     (b"\x89PNG\r\n\x1a\n", "png"),
@@ -156,9 +170,29 @@ def clean_item(data, partial=False):
         out["part_number"] = _text(data, "part_number", "Part number", required=True, max_len=100)
     if "description" in data or not partial:
         out["description"] = _text(data, "description", "Description", max_len=2000)
+    if "category" in data or not partial:
+        out["category"] = _text(data, "category", "Category", max_len=100)
     if "unit_value" in data or not partial:
         out["unit_value"] = _money(data.get("unit_value"))
     return out
+
+
+def clean_code(value):
+    code = str(value or "").strip()
+    if not CODE_RE.match(code):
+        raise ValidationError(
+            "Code must be 1-40 letters, numbers, '-', '_', '.' or '/', starting with a letter or number"
+        )
+    return code
+
+
+def scanned_code(text):
+    """The code from scanned text, which may be a full label link like http://host/s/LOC-0001."""
+    text = str(text or "").strip()
+    for marker in ("/s/", "#scan/"):
+        if marker in text:
+            text = unquote(text.split(marker, 1)[1]).strip().rstrip("/")
+    return text
 
 
 def _like(term):
@@ -186,11 +220,12 @@ class Store:
 
     def _migrate(self):
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        columns = [r["name"] for r in self.conn.execute("PRAGMA table_info(items)")]
-        script = MIGRATE_V1 if "quantity" in columns else TABLES
-        self.conn.executescript(f"BEGIN; {script} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
+        if version < 2:
+            columns = [r["name"] for r in self.conn.execute("PRAGMA table_info(items)")]
+            script = MIGRATE_V1 if "quantity" in columns else TABLES
+            self.conn.executescript(f"BEGIN; {script} PRAGMA user_version = 2; COMMIT;")
+        if version < 3:
+            self.conn.executescript(f"BEGIN; {MIGRATE_V3} PRAGMA user_version = 3; COMMIT;")
 
     @contextmanager
     def tx(self):
@@ -238,16 +273,20 @@ class Store:
             item["image_url"] = f"/uploads/{item['image']}" if item.get("image") else None
         return items
 
-    def search(self, query="", sort="part_number", order="asc", location_id=None):
+    def search(self, query="", sort="part_number", order="asc", location_id=None, category=None):
         where, params = [], []
         for term in query.split():
-            # Every word must match the P/N, the description, or a location holding the part.
+            # Every word must match the P/N, description, category, or a location holding the part.
             where.append(
                 """(i.part_number LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\'
+                    OR i.category LIKE ? ESCAPE '\\'
                     OR EXISTS (SELECT 1 FROM stock s JOIN locations l ON l.id = s.location_id
                                WHERE s.item_id = i.id AND s.quantity > 0 AND l.name LIKE ? ESCAPE '\\'))"""
             )
-            params += [_like(term)] * 3
+            params += [_like(term)] * 4
+        if category is not None:
+            where.append("i.category = ? COLLATE NOCASE")
+            params.append(category)
         if location_id:
             where.append("EXISTS (SELECT 1 FROM stock s WHERE s.item_id = i.id AND s.location_id = ? AND s.quantity > 0)")
             params.append(int(location_id))
@@ -268,8 +307,8 @@ class Store:
         try:
             with self.tx():
                 cur = self.conn.execute(
-                    "INSERT INTO items (part_number, description, unit_value) VALUES (?, ?, ?)",
-                    (fields["part_number"], fields["description"], fields["unit_value"]),
+                    "INSERT INTO items (part_number, description, category, unit_value) VALUES (?, ?, ?, ?)",
+                    (fields["part_number"], fields["description"], fields["category"], fields["unit_value"]),
                 )
                 if quantity:
                     location = self._location(data.get("location"), create=True)
@@ -343,7 +382,19 @@ class Store:
         if len(name) > 100:
             raise ValidationError("Location name must be 100 characters or fewer")
         cur = self.conn.execute("INSERT INTO locations (name) VALUES (?)", (name,))
+        self._assign_code(cur.lastrowid)
         return self._one("SELECT * FROM locations WHERE id = ?", (cur.lastrowid,))
+
+    def _assign_code(self, location_id, code=None):
+        """Set a location's code, or generate LOC-0001 style when none is given."""
+        if code is None:
+            code, n = f"LOC-{location_id:04d}", 1
+            while self._one("SELECT 1 FROM locations WHERE code = ? COLLATE NOCASE AND id != ?", (code, location_id)):
+                code, n = f"LOC-{location_id:04d}-{n}", n + 1
+        try:
+            self.conn.execute("UPDATE locations SET code = ? WHERE id = ?", (code, location_id))
+        except sqlite3.IntegrityError:
+            raise ValidationError(f"Code '{code}' is already used by another location")
 
     def _job(self, number, create=False):
         number = str(number or "").strip()
@@ -499,13 +550,15 @@ class Store:
 
     def create_location(self, data):
         name = _text(data, "name", "Location name", required=True, max_len=100)
-        try:
-            with self.tx():
+        code = clean_code(data["code"]) if str(data.get("code") or "").strip() else None
+        with self.tx():
+            try:
                 cur = self.conn.execute(
                     "INSERT INTO locations (name, notes) VALUES (?, ?)", (name, _text(data, "notes", "Notes", max_len=500))
                 )
-        except sqlite3.IntegrityError:
-            raise ValidationError(f"Location '{name}' already exists")
+            except sqlite3.IntegrityError:
+                raise ValidationError(f"Location '{name}' already exists")
+            self._assign_code(cur.lastrowid, code)
         return self.get_location(cur.lastrowid)
 
     def update_location(self, location_id, data):
@@ -514,6 +567,8 @@ class Store:
             fields["name"] = _text(data, "name", "Location name", required=True, max_len=100)
         if "notes" in data:
             fields["notes"] = _text(data, "notes", "Notes", max_len=500)
+        if "code" in data:
+            fields["code"] = clean_code(data["code"])
         try:
             with self.tx():
                 if not self._one("SELECT 1 FROM locations WHERE id = ?", (location_id,)):
@@ -521,9 +576,54 @@ class Store:
                 if fields:
                     sets = ", ".join(f"{k} = ?" for k in fields)
                     self.conn.execute(f"UPDATE locations SET {sets} WHERE id = ?", (*fields.values(), location_id))
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "code" in str(e):
+                raise ValidationError(f"Code '{fields.get('code')}' is already used by another location")
             raise ValidationError(f"Location '{fields.get('name')}' already exists")
         return self.get_location(location_id)
+
+    def location_contents(self, location_id):
+        """A location with the parts stored in it."""
+        with self.lock:
+            location = self.get_location(location_id)
+            rows = self.conn.execute(
+                """SELECT i.*, s.quantity AS here FROM stock s JOIN items i ON i.id = s.item_id
+                   WHERE s.location_id = ? AND s.quantity > 0 ORDER BY i.part_number COLLATE NOCASE""",
+                (location_id,),
+            ).fetchall()
+            here = {r["id"]: r["here"] for r in rows}
+            items = self._with_stock(rows)
+        for item in items:
+            item["here"] = here[item["id"]]
+            item["here_value"] = round(item["here"] * item["unit_value"], 2)
+        location["items"] = items
+        return location
+
+    def scan(self, text):
+        """Work out what a scanned or typed code refers to: a location code, a P/N,
+        a location name or a job number (in that order)."""
+        code = scanned_code(text)
+        if not code:
+            raise ValidationError("Nothing to look up")
+        with self.lock:
+            for kind, sql in (
+                ("location", "SELECT id FROM locations WHERE code = ? COLLATE NOCASE"),
+                ("part", "SELECT id FROM items WHERE part_number = ?"),
+                ("location", "SELECT id FROM locations WHERE name = ?"),
+                ("job", "SELECT id FROM jobs WHERE number = ?"),
+            ):
+                row = self._one(sql, (code,))
+                if row:
+                    return {"type": kind, "id": row["id"], "code": code}
+        raise NotFound(f"Nothing found for '{code}'")
+
+    def categories(self):
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT MIN(category) AS name, COUNT(*) AS parts FROM items WHERE category != ''
+                   GROUP BY category COLLATE NOCASE ORDER BY category COLLATE NOCASE"""
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def delete_location(self, location_id):
         with self.tx():

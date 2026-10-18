@@ -6,15 +6,20 @@ import io
 import json
 import mimetypes
 import re
+import socket
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .store import NotFound, Store, ValidationError
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-CSV_FIELDS = ["part_number", "description", "location", "quantity", "unit_value", "total_value"]
+CSV_FIELDS = ["part_number", "description", "category", "location", "quantity", "unit_value", "total_value"]
+LABEL_FIELDS = {
+    "locations": ["code", "name", "notes", "link", "contents"],
+    "parts": ["code", "part_number", "description", "category", "link"],
+}
 JOB_CSV_FIELDS = ["job", "part_number", "description", "quantity", "total_value"]
 MAX_BODY = 12 * 1024 * 1024
 
@@ -39,6 +44,7 @@ ROUTES = [
     ("POST", r"/api/items/(\d+)/(receive|book-out|return|transfer|count)", "stock_action"),
     ("GET", r"/api/locations", "list_locations"),
     ("POST", r"/api/locations", "create_location"),
+    ("GET", r"/api/locations/(\d+)", "get_location"),
     ("PUT", r"/api/locations/(\d+)", "update_location"),
     ("DELETE", r"/api/locations/(\d+)", "delete_location"),
     ("GET", r"/api/jobs", "list_jobs"),
@@ -49,10 +55,24 @@ ROUTES = [
     ("GET", r"/api/jobs/(\d+)/export\.csv", "export_job"),
     ("GET", r"/api/history", "history"),
     ("GET", r"/api/summary", "summary"),
+    ("GET", r"/api/categories", "list_categories"),
+    ("GET", r"/api/scan", "scan"),
+    ("GET", r"/api/info", "info"),
+    ("GET", r"/api/labels\.csv", "export_labels"),
     ("GET", r"/api/export\.csv", "export_items"),
     ("POST", r"/api/import", "import_items"),
 ]
 ROUTES = [(m, re.compile(f"^{p}$"), h) for m, p, h in ROUTES]
+
+
+def lan_address():
+    """This machine's address on the local network (no packets are sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+    except OSError:
+        return None
 
 
 def to_csv(fields, rows):
@@ -107,6 +127,10 @@ def make_handler(store):
         def handle_request(self, method):
             url = urlparse(self.path)
             self.query = {k: v[0] for k, v in parse_qs(url.query).items()}
+            if method == "GET" and url.path.startswith("/s/"):
+                # Short link printed in label QR codes; the page looks the code up.
+                code = unquote(url.path[len("/s/"):])
+                return self.send(HTTPStatus.FOUND, "", "text/plain", {"Location": "/#scan/" + quote(code, safe="")})
             try:
                 for route_method, pattern, name in ROUTES:
                     if route_method == method and (m := pattern.match(url.path)):
@@ -138,8 +162,13 @@ def make_handler(store):
         def list_items(self):
             q = self.query
             items = store.search(q.get("q", ""), q.get("sort", "part_number"), q.get("order", "asc"),
-                                 q.get("location_id") or None)
+                                 q.get("location_id") or None, self.category())
             self.send(HTTPStatus.OK, {"items": items, "summary": store.summary()})
+
+        def category(self):
+            """The category filter: absent means all, '__none__' means uncategorised."""
+            cat = self.query.get("category")
+            return "" if cat == "__none__" else cat
 
         def create_item(self):
             self.send(HTTPStatus.CREATED, store.create(self.json_body()))
@@ -169,7 +198,8 @@ def make_handler(store):
 
         def export_items(self):
             rows = []
-            for item in store.search(self.query.get("q", ""), location_id=self.query.get("location_id") or None):
+            for item in store.search(self.query.get("q", ""), location_id=self.query.get("location_id") or None,
+                                     category=self.category()):
                 for loc in item["locations"] or [{"name": "", "quantity": 0}]:
                     rows.append({**item, "location": loc["name"], "quantity": loc["quantity"],
                                  "total_value": round(loc["quantity"] * item["unit_value"], 2)})
@@ -189,6 +219,9 @@ def make_handler(store):
 
         def create_location(self):
             self.send(HTTPStatus.CREATED, store.create_location(self.json_body()))
+
+        def get_location(self, location_id):
+            self.send(HTTPStatus.OK, store.location_contents(location_id))
 
         def update_location(self, location_id):
             self.send(HTTPStatus.OK, store.update_location(location_id, self.json_body()))
@@ -219,6 +252,45 @@ def make_handler(store):
             rows = [{**p, "job": job["number"]} for p in job["parts"]]
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", job["number"])
             self.send_csv(to_csv(JOB_CSV_FIELDS, rows), f"job-{safe}.csv")
+
+        def list_categories(self):
+            self.send(HTTPStatus.OK, store.categories())
+
+        def scan(self):
+            self.send(HTTPStatus.OK, store.scan(self.query.get("code", "")))
+
+        def info(self):
+            host, port = self.server.server_address[:2]
+            if host in ("0.0.0.0", "", "::"):
+                host = lan_address()
+            elif host.startswith("127.") or host in ("localhost", "::1"):
+                host = None  # only reachable from this computer
+            self.send(HTTPStatus.OK, {"lan_url": f"http://{host}:{port}" if host else None})
+
+        def export_labels(self):
+            """Label data for a P-touch Editor database merge."""
+            kind = self.query.get("type", "locations")
+            if kind not in LABEL_FIELDS:
+                raise ValidationError("type must be 'locations' or 'parts'")
+            base = self.query.get("base", "").rstrip("/")
+            ids = {int(i) for i in self.query.get("ids", "").split(",") if i.strip()}
+            rows = []
+            if kind == "locations":
+                for loc in store.locations():
+                    if ids and loc["id"] not in ids:
+                        continue
+                    items = store.location_contents(loc["id"])["items"]
+                    contents = "; ".join(f"{i['part_number']} x{i['here']}" for i in items[:8])
+                    rows.append({**loc, "link": f"{base}/s/{quote(loc['code'], safe='')}",
+                                 "contents": contents + ("; ..." if len(items) > 8 else "")})
+            else:
+                for item in store.search():
+                    if ids and item["id"] not in ids:
+                        continue
+                    rows.append({**item, "code": item["part_number"],
+                                 "link": f"{base}/s/{quote(item['part_number'], safe='')}"})
+            # BOM so P-touch Editor and Excel read it as UTF-8
+            self.send_csv("\ufeff" + to_csv(LABEL_FIELDS[kind], rows), f"labels-{kind}.csv")
 
         def summary(self):
             self.send(HTTPStatus.OK, store.summary())

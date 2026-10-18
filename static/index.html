@@ -8,7 +8,10 @@
 </head>
 <body>
   <header>
-    <h1>Inventory</h1>
+    <div class="brand">
+      <h1>Inventory</h1>
+      <button id="scan-btn" class="primary" title="Scan or type a label code">Scan</button>
+    </div>
     <div class="stats">
       <div><span id="stat-items">0</span><label>Parts</label></div>
       <div><span id="stat-units">0</span><label>Units</label></div>
@@ -30,8 +33,10 @@
     <section id="view-parts" class="view">
       <div class="toolbar">
         <input class="search" id="parts-search" type="search" placeholder="Search P/N, description or location…" autocomplete="off">
+        <select id="category-filter" aria-label="Category"></select>
         <select id="location-filter" aria-label="Location"></select>
         <button id="add-part" class="primary">+ Add part</button>
+        <button id="label-parts">Print labels</button>
         <a id="export-parts" class="button" href="/api/export.csv">Export CSV</a>
         <label class="button">Import CSV<input id="import-file" type="file" accept=".csv,text/csv" hidden></label>
       </div>
@@ -42,6 +47,7 @@
               <th class="thumb-col"></th>
               <th data-sort="part_number">P/N</th>
               <th data-sort="description">Description</th>
+              <th data-sort="category">Category</th>
               <th>Locations</th>
               <th data-sort="quantity" class="num">Qty</th>
               <th data-sort="unit_value" class="num">Unit value</th>
@@ -82,12 +88,13 @@
     <section id="view-locations" class="view" hidden>
       <div class="toolbar">
         <button id="add-location" class="primary">+ Add location</button>
+        <button id="label-locations">Print labels</button>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Location</th><th>Notes</th><th class="num">Parts</th>
+              <th>Location</th><th>Code</th><th>Notes</th><th class="num">Parts</th>
               <th class="num">Units</th><th class="num">Value</th><th></th>
             </tr>
           </thead>
@@ -124,8 +131,13 @@
   <datalist id="dl-locations"></datalist>
   <datalist id="dl-jobs"></datalist>
   <datalist id="dl-parts"></datalist>
+  <datalist id="dl-categories"></datalist>
+  <!-- Filled with labels just before printing -->
+  <div id="print-area"></div>
   <input id="image-file" type="file" accept="image/*" hidden>
 
+  <script src="vendor/qrcode.js"></script>
+  <script src="labels.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

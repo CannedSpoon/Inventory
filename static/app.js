@@ -7,7 +7,8 @@ const number = new Intl.NumberFormat();
 
 const state = {
   view: "parts",
-  parts: { q: "", sort: "part_number", order: "asc", locationId: "" },
+  parts: { q: "", sort: "part_number", order: "asc", locationId: "", category: "" },
+  lastParts: [],
   jobs: { q: "", status: "open" },
   history: { q: "" },
   locations: [],
@@ -82,10 +83,11 @@ async function refresh() {
 }
 
 async function loadLookups() {
-  const [summary, locations, jobs] = await Promise.all([
+  const [summary, locations, jobs, categories] = await Promise.all([
     api("GET", "/api/summary"),
     api("GET", "/api/locations"),
     api("GET", "/api/jobs?status=open"),
+    api("GET", "/api/categories"),
   ]);
   $("#stat-items").textContent = number.format(summary.items);
   $("#stat-units").textContent = number.format(summary.units);
@@ -101,6 +103,16 @@ async function loadLookups() {
     locations.map((l) => `<option value="${l.id}">${esc(l.name)} (${number.format(l.parts)})</option>`).join("");
   if (!locations.some((l) => String(l.id) === state.parts.locationId)) state.parts.locationId = "";
   filter.value = state.parts.locationId;
+
+  $("#dl-categories").innerHTML = categories.map((c) => `<option value="${esc(c.name)}">`).join("");
+  const catFilter = $("#category-filter");
+  catFilter.innerHTML =
+    `<option value="">All categories</option>` +
+    categories.map((c) => `<option value="${esc(c.name)}">${esc(c.name)} (${number.format(c.parts)})</option>`).join("") +
+    `<option value="__none__">No category</option>`;
+  const cat = state.parts.category;
+  if (cat && cat !== "__none__" && !categories.some((c) => c.name.toLowerCase() === cat.toLowerCase())) state.parts.category = "";
+  catFilter.value = state.parts.category;
 }
 
 function loadView() {
@@ -119,7 +131,9 @@ async function loadParts() {
   const p = state.parts;
   const params = new URLSearchParams({ q: p.q, sort: p.sort, order: p.order });
   if (p.locationId) params.set("location_id", p.locationId);
+  if (p.category) params.set("category", p.category);
   const { items } = await api("GET", `/api/items?${params}`);
+  state.lastParts = items;
   $("#parts-rows").innerHTML = items
     .map(
       (it) => `
@@ -127,6 +141,7 @@ async function loadParts() {
       <td class="thumb-col">${thumb(it)}</td>
       <td class="pn">${highlight(it.part_number, p.q)}</td>
       <td class="desc">${highlight(it.description, p.q)}</td>
+      <td class="cat">${it.category ? `<span class="tag">${highlight(it.category, p.q)}</span>` : ""}</td>
       <td class="chips">${it.locations
         .map((l) => `<span class="chip">${highlight(l.name, p.q)} <b>${number.format(l.quantity)}</b></span>`)
         .join("")}</td>
@@ -141,13 +156,14 @@ async function loadParts() {
     )
     .join("");
   setEmpty("#parts-empty", !items.length,
-    p.q || p.locationId ? "No parts match your search." : "No parts yet. Click “+ Add part” to get started.");
+    p.q || p.locationId || p.category ? "No parts match your search." : "No parts yet. Click “+ Add part” to get started.");
   $$("#view-parts th[data-sort]").forEach((th) => {
     th.classList.toggle("sorted-asc", th.dataset.sort === p.sort && p.order === "asc");
     th.classList.toggle("sorted-desc", th.dataset.sort === p.sort && p.order === "desc");
   });
   const exportParams = new URLSearchParams({ q: p.q });
   if (p.locationId) exportParams.set("location_id", p.locationId);
+  if (p.category) exportParams.set("category", p.category);
   $("#export-parts").href = `/api/export.csv?${exportParams}`;
 }
 
@@ -159,6 +175,16 @@ $("#parts-search").addEventListener("input", debounce((e) => {
   state.parts.q = e.target.value.trim();
   loadParts().catch((err) => showMessage(err.message, true));
 }));
+
+$("#category-filter").addEventListener("change", (e) => {
+  state.parts.category = e.target.value;
+  loadParts().catch((err) => showMessage(err.message, true));
+});
+
+$("#label-parts").addEventListener("click", () => {
+  if (!state.lastParts.length) return showMessage("No parts listed to print labels for.", true);
+  labelDialog("parts", state.lastParts.map(partLabel));
+});
 
 $("#location-filter").addEventListener("change", (e) => {
   state.parts.locationId = e.target.value;
@@ -254,14 +280,15 @@ async function loadLocations() {
   $("#locations-rows").innerHTML = locs
     .map(
       (l) => `
-    <tr data-id="${l.id}">
+    <tr data-id="${l.id}" class="clickable">
       <td class="pn">${esc(l.name)}</td>
+      <td class="code">${esc(l.code)}</td>
       <td class="desc">${esc(l.notes)}</td>
       <td class="num">${number.format(l.parts)}</td>
       <td class="num">${number.format(l.units)}</td>
       <td class="num">${money.format(l.total_value)}</td>
       <td class="actions">
-        <button data-action="view">View parts</button>
+        <button data-action="label">Label</button>
         <button data-action="edit">Edit</button>
         <button data-action="delete" title="Delete">✕</button>
       </td>
@@ -273,12 +300,14 @@ async function loadLocations() {
 }
 
 $("#locations-rows").addEventListener("click", async (e) => {
+  const row = e.target.closest("tr");
+  if (!row) return;
   const action = e.target.closest("button")?.dataset.action;
-  if (!action) return;
-  const loc = state.locations.find((l) => String(l.id) === e.target.closest("tr").dataset.id);
-  if (action === "view") {
-    state.parts.locationId = String(loc.id);
-    location.hash = "parts";
+  const loc = state.locations.find((l) => String(l.id) === row.dataset.id);
+  if (!action) {
+    openLocation(loc.id);
+  } else if (action === "label") {
+    labelDialog("locations", [locationLabel(loc)]);
   } else if (action === "edit") {
     locationForm(loc);
   } else if (action === "delete") {
@@ -294,6 +323,10 @@ $("#locations-rows").addEventListener("click", async (e) => {
 });
 
 $("#add-location").addEventListener("click", () => locationForm(null));
+$("#label-locations").addEventListener("click", () => {
+  if (!state.locations.length) return showMessage("Add a location first.", true);
+  labelDialog("locations", state.locations.map(locationLabel));
+});
 
 // --- history view ----------------------------------------------------------
 
@@ -326,12 +359,13 @@ $("#history-search").addEventListener("input", debounce((e) => {
   loadHistory().catch((err) => showMessage(err.message, true));
 }));
 
-// Job links in any history table open that job.
+// Job and location links anywhere open that job or location.
 document.addEventListener("click", (e) => {
-  const link = e.target.closest("a[data-job]");
+  const link = e.target.closest("a[data-job], a[data-location]");
   if (!link) return;
   e.preventDefault();
-  openJob(link.dataset.job);
+  if (link.dataset.job) openJob(link.dataset.job);
+  else openLocation(link.dataset.location);
 });
 
 // --- generic form dialog -----------------------------------------------------
@@ -359,7 +393,7 @@ function fieldHtml(f) {
   return `<label data-field="${f.name}">${esc(f.label)}${input}${f.hint ? `<small>${esc(f.hint)}</small>` : ""}</label>`;
 }
 
-function formDialog({ title, intro = "", fields, submitLabel = "Save", onSubmit, setup }) {
+function formDialog({ title, intro = "", fields, submitLabel = "Save", onSubmit, setup, extraButtons = [], wide = false }) {
   const dlg = $("#form-dialog");
   dlg.innerHTML = `
     <form>
@@ -368,11 +402,25 @@ function formDialog({ title, intro = "", fields, submitLabel = "Save", onSubmit,
       ${fields.map(fieldHtml).join("")}
       <p class="error" hidden></p>
       <div class="actions">
+        ${extraButtons.map((b, i) => `<button type="button" data-extra="${i}">${esc(b.label)}</button>`).join("")}
         <button type="button" data-close>Cancel</button>
         <button type="submit" class="primary">${esc(submitLabel)}</button>
       </div>
     </form>`;
+  dlg.classList.toggle("medium", wide);
   const form = $("form", dlg);
+  $$("[data-extra]", form).forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const box = $(".error", form);
+      box.hidden = true;
+      try {
+        await extraButtons[btn.dataset.extra].onClick(Object.fromEntries(new FormData(form)), form);
+      } catch (err) {
+        box.textContent = err.message;
+        box.hidden = false;
+      }
+    })
+  );
   $("[data-close]", form).addEventListener("click", () => dlg.close());
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -400,6 +448,8 @@ function partForm(item) {
   const fields = [
     { name: "part_number", label: "P/N", required: true, value: item?.part_number, autofocus: true },
     { name: "description", label: "Description", type: "textarea", value: item?.description },
+    { name: "category", label: "Category", list: "dl-categories", value: item?.category,
+      placeholder: "e.g. Resistors, Fasteners", hint: "Pick one, or type a new category." },
     { name: "unit_value", label: "Unit value ($)", type: "number", min: 0, step: "0.01", value: item?.unit_value ?? 0, required: true },
   ];
   if (!item) {
@@ -438,7 +488,7 @@ async function stockDialog(mode, item, preset = {}) {
   const fields = [];
   let parts = [];
   if (!item) {
-    parts = (await api("GET", "/api/items")).items.filter((p) => p.quantity > 0);
+    parts = (await api("GET", "/api/items")).items.filter((p) => mode === "receive" || p.quantity > 0);
     $("#dl-parts").innerHTML = parts.map((p) => `<option value="${esc(p.part_number)}">${esc(p.description)}</option>`).join("");
     fields.push({ name: "part", label: "P/N", list: "dl-parts", required: true, autofocus: true, placeholder: "Start typing a P/N…" });
   }
@@ -498,6 +548,7 @@ async function stockDialog(mode, item, preset = {}) {
           const picked = parts.find((p) => p.part_number.toLowerCase() === f.part.value.trim().toLowerCase()) || null;
           if (picked === item) return; // change also fires on blur; don't reset the chosen location
           item = picked;
+          if (f.location.tagName !== "SELECT") return;
           const previous = f.location.value;
           f.location.innerHTML = item
             ? locationOptions(item).map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("")
@@ -543,7 +594,7 @@ async function openPart(id) {
           </div>
           <div class="info">
             <h2 class="pn">${esc(item.part_number)}</h2>
-            <p class="description">${esc(item.description) || "<em>No description</em>"}</p>
+            <p class="description">${item.category ? `<span class="tag">${esc(item.category)}</span> ` : ""}${esc(item.description) || "<em>No description</em>"}</p>
             <dl>
               <div><dt>Quantity</dt><dd class="${item.quantity ? "" : "low"}">${number.format(item.quantity)}</dd></div>
               <div><dt>Unit value</dt><dd>${money.format(item.unit_value)}</dd></div>
@@ -554,6 +605,7 @@ async function openPart(id) {
               <button data-act="receive">Receive stock</button>
               <button data-act="transfer"${item.quantity ? "" : " disabled"}>Move</button>
               <button data-act="edit">Edit</button>
+              <button data-act="label">Print label</button>
               <button data-act="delete" class="danger">Delete</button>
             </div>
           </div>
@@ -566,7 +618,7 @@ async function openPart(id) {
               <tbody>${item.locations
                 .map(
                   (l) => `<tr data-loc="${esc(l.name)}">
-                    <td>${esc(l.name)}</td>
+                    <td><a href="#" data-location="${l.location_id}">${esc(l.name)}</a></td>
                     <td class="num">${number.format(l.quantity)}</td>
                     <td class="num">${money.format(l.quantity * item.unit_value)}</td>
                     <td class="actions">
@@ -594,6 +646,7 @@ async function openPart(id) {
         if (act === "close") dlg.close();
         else if (STOCK_ACTIONS[act]) stockDialog(act, item, { location: loc });
         else if (act === "edit") partForm(item);
+        else if (act === "label") labelDialog("parts", [partLabel(item)]);
         else if (act === "upload") pickImage(item);
         else if (act === "remove-image") {
           if (!confirm("Remove this picture?")) return;
@@ -783,20 +836,296 @@ function locationForm(loc) {
     title: loc ? `Edit ${loc.name}` : "Add location",
     fields: [
       { name: "name", label: "Name", required: true, value: loc?.name, autofocus: true, placeholder: "e.g. Shelf A, Van 2, Bin 14" },
+      { name: "code", label: "Label code", value: loc?.code, placeholder: "Automatic, e.g. LOC-0007",
+        hint: "What the barcode holds. Letters, numbers, - _ . / only. Changing it means reprinting the label." },
       { name: "notes", label: "Notes", type: "textarea", value: loc?.notes },
     ],
     onSubmit: async (data) => {
+      if (loc && !data.code.trim()) delete data.code; // keep the existing code
       const saved = loc ? await api("PUT", `/api/locations/${loc.id}`, data) : await api("POST", "/api/locations", data);
-      showMessage(`Saved ${saved.name}.`);
+      showMessage(`Saved ${saved.name} (${saved.code}).`);
       refresh();
     },
   });
 }
 
+// --- location (container) details ------------------------------------------
+
+async function openLocation(id) {
+  const dlg = $("#detail-dialog");
+  const render = async () => {
+    const loc = await api("GET", `/api/locations/${id}`);
+    dlg.innerHTML = `
+      <div class="detail">
+        <button class="close" data-act="close" aria-label="Close">✕</button>
+        <div class="info">
+          <h2>${esc(loc.name)} <span class="code-chip">${esc(loc.code)}</span></h2>
+          ${loc.notes ? `<p class="description">${esc(loc.notes)}</p>` : ""}
+          <dl>
+            <div><dt>Parts</dt><dd>${number.format(loc.parts)}</dd></div>
+            <div><dt>Units</dt><dd>${number.format(loc.units)}</dd></div>
+            <div><dt>Value</dt><dd>${money.format(loc.total_value)}</dd></div>
+          </dl>
+          <div class="button-row">
+            <button class="primary" data-act="receive">Add stock here</button>
+            <button data-act="label">Print label</button>
+            <button data-act="edit">Edit</button>
+            ${loc.units ? "" : `<button data-act="delete" class="danger">Delete</button>`}
+          </div>
+        </div>
+
+        <h3>In this location</h3>
+        ${loc.items.length
+          ? `<div class="table-wrap"><table class="cards">
+              <thead><tr><th class="thumb-col"></th><th>P/N</th><th>Description</th><th>Category</th>
+                <th class="num">Qty here</th><th class="num">Value</th><th></th></tr></thead>
+              <tbody>${loc.items
+                .map(
+                  (it) => `<tr data-id="${it.id}" class="clickable">
+                    <td class="thumb-col">${thumb(it)}</td>
+                    <td class="pn">${esc(it.part_number)}</td>
+                    <td class="desc">${esc(it.description)}</td>
+                    <td class="cat">${it.category ? `<span class="tag">${esc(it.category)}</span>` : ""}</td>
+                    <td class="num qty">${number.format(it.here)}${it.quantity > it.here ? `<small class="muted"> of ${number.format(it.quantity)}</small>` : ""}</td>
+                    <td class="num total">${money.format(it.here_value)}</td>
+                    <td class="actions">
+                      <button data-act="book_out">Book out</button>
+                      <button data-act="transfer">Move</button>
+                    </td></tr>`
+                )
+                .join("")}</tbody></table></div>`
+          : `<p class="muted">Nothing here yet. Use “Add stock here” to put parts in this location.</p>`}
+      </div>`;
+
+    dlg.onclick = async (e) => {
+      if (e.target.closest("a")) return;
+      const act = e.target.closest("button")?.dataset.act;
+      const row = e.target.closest("tr[data-id]");
+      try {
+        if (act === "close") dlg.close();
+        else if (act === "receive") stockDialog("receive", null, { location: loc.name });
+        else if (act === "label") labelDialog("locations", [locationLabel(loc)]);
+        else if (act === "edit") locationForm(loc);
+        else if (act === "delete") {
+          if (!confirm(`Delete location ${loc.name}?`)) return;
+          await api("DELETE", `/api/locations/${loc.id}`);
+          dlg.close();
+          showMessage(`Deleted ${loc.name}.`);
+          refresh();
+        } else if (act && row) {
+          const item = loc.items.find((it) => String(it.id) === row.dataset.id);
+          stockDialog(act, item, { location: loc.name });
+        } else if (!act && row) openPart(row.dataset.id);
+      } catch (err) {
+        showMessage(err.message, true);
+      }
+    };
+  };
+  await showDetail(render);
+}
+
+// --- scanning ----------------------------------------------------------------
+
+// Look up a scanned or typed code (location code, P/N, location name or job number) and open it.
+async function scan(text) {
+  const code = String(text || "").trim();
+  if (!code) return;
+  const hit = await api("GET", `/api/scan?${new URLSearchParams({ code })}`);
+  if ($("#form-dialog").open) $("#form-dialog").close();
+  if (hit.type === "location") await openLocation(hit.id);
+  else if (hit.type === "part") await openPart(hit.id);
+  else await openJob(hit.id);
+}
+
+function scanDialog() {
+  formDialog({
+    title: "Scan a label",
+    intro: `<p class="muted">Scan a label with a barcode scanner, or type a location code, P/N or job number.
+      On a phone, point the camera app at a label's QR code instead.</p>`,
+    fields: [{ name: "code", label: "Code", autofocus: true, placeholder: "e.g. LOC-0003" }],
+    submitLabel: "Look up",
+    onSubmit: (data) => scan(data.code),
+  });
+}
+
+$("#scan-btn").addEventListener("click", scanDialog);
+
+// --- labels ------------------------------------------------------------------
+
+const LABEL_SETTINGS = "labelSettings";
+const isLocalHost = (host) => ["localhost", "127.0.0.1", "::1", "[::1]"].includes(host);
+let serverInfo = null;
+
+function labelSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(LABEL_SETTINGS)) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLabelSettings(settings) {
+  try {
+    localStorage.setItem(LABEL_SETTINGS, JSON.stringify(settings));
+  } catch {
+    // settings just won't be remembered
+  }
+}
+
+// The address phones should use: this page's address, unless it's localhost.
+async function defaultLinkBase() {
+  if (!isLocalHost(location.hostname)) return location.origin;
+  serverInfo = serverInfo || (await api("GET", "/api/info").catch(() => ({})));
+  return serverInfo.lan_url || location.origin;
+}
+
+function partLabel(item) {
+  return { id: item.id, code: item.part_number, title: item.description, subtitle: item.category };
+}
+
+function locationLabel(loc) {
+  return { id: loc.id, code: loc.code, title: loc.name, subtitle: loc.notes };
+}
+
+async function labelDialog(kind, labels) {
+  const saved = labelSettings();
+  const base = saved.base || (await defaultLinkBase());
+  let rendered = []; // [{label, canvas}] for the ticked labels
+
+  const settingsFrom = (data) => ({ tape: Number(data.tape), type: data.type, base: data.base.trim().replace(/\/+$/, "") });
+  const withLink = (label, base) => ({ ...label, link: `${base}/s/${encodeURIComponent(label.code)}` });
+  const picked = () => rendered.filter((r) => r.canvas && r.checkbox.checked);
+
+  formDialog({
+    title: labels.length > 1 ? `Print ${labels.length} labels` : `Label for ${labels[0].code}`,
+    wide: true,
+    fields: [
+      { name: "tape", label: "Tape width", type: "select", value: String(saved.tape || 24),
+        options: Object.keys(Labels.TAPES).sort((a, b) => b - a).map((w) => ({ value: w, label: `${w} mm` })) },
+      { name: "type", label: "Code type", type: "select", value: saved.type || "qr",
+        options: [
+          { value: "qr", label: "QR code: scan with a phone camera or a 2D scanner" },
+          { value: "code128", label: "Barcode (Code 128): works with any handheld scanner" },
+        ] },
+      { name: "base", label: "Web address in QR codes", value: base, hint: " " },
+    ],
+    submitLabel: "Print",
+    extraButtons: [
+      {
+        label: "Download PNG",
+        onClick: async () => {
+          const chosen = picked();
+          if (!chosen.length) throw new Error("Tick at least one label");
+          for (const [i, r] of chosen.entries()) {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(await Labels.png(r.canvas));
+            a.download = `label-${r.label.code.replace(/[^\w.-]+/g, "_")}.png`;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            if (i < chosen.length - 1) await new Promise((res) => setTimeout(res, 400));
+          }
+        },
+      },
+      {
+        label: "P-touch Editor CSV",
+        onClick: async (data) => {
+          const chosen = picked();
+          if (!chosen.length) throw new Error("Tick at least one label");
+          const params = new URLSearchParams({ type: kind, base: settingsFrom(data).base, ids: chosen.map((r) => r.label.id).join(",") });
+          const a = document.createElement("a");
+          a.href = `/api/labels.csv?${params}`;
+          a.click();
+        },
+      },
+    ],
+    setup: (form) => {
+      const preview = document.createElement("div");
+      preview.className = "label-list";
+      $(".error", form).before(preview);
+      const hint = $("[data-field=base] small", form);
+
+      const update = () => {
+        const data = Object.fromEntries(new FormData(form));
+        const settings = settingsFrom(data);
+        saveLabelSettings(settings);
+        $("[data-field=base]", form).hidden = settings.type !== "qr";
+        let host = "";
+        try {
+          host = new URL(settings.base).hostname;
+        } catch {
+          host = "";
+        }
+        hint.textContent = isLocalHost(host)
+          ? "⚠ Phones can't reach “localhost”. Start the app with --host 0.0.0.0 and use this computer's network address."
+          : "The address phones use to reach this app. Scanning a QR code opens the location or part.";
+        hint.classList.toggle("error", isLocalHost(host));
+
+        const wasChecked = new Map(rendered.map((r) => [r.label.code, r.checkbox.checked]));
+        preview.innerHTML = "";
+        rendered = labels.map((label) => {
+          const row = document.createElement("label");
+          row.className = "label-item";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = wasChecked.get(label.code) ?? true;
+          checkbox.hidden = labels.length === 1;
+          row.append(checkbox);
+          let canvas = null;
+          try {
+            canvas = Labels.render(withLink(label, settings.base), settings);
+            canvas.title = `${Labels.mm(canvas.width)} × ${settings.tape} mm`;
+            row.append(canvas);
+          } catch (err) {
+            checkbox.checked = false;
+            checkbox.disabled = true;
+            row.insertAdjacentHTML("beforeend", `<span class="error">${esc(label.code)}: ${esc(err.message)}</span>`);
+          }
+          preview.append(row);
+          return { label, canvas, checkbox };
+        });
+      };
+      form.addEventListener("change", (e) => e.target.type !== "checkbox" && update());
+      $("[name=base]", form).addEventListener("input", debounce(update, 300));
+      update();
+    },
+    onSubmit: async (data) => {
+      const chosen = picked();
+      if (!chosen.length) throw new Error("Tick at least one label");
+      await printLabels(chosen.map((r) => r.canvas), Number(data.tape));
+    },
+  });
+}
+
+// Print through the P-touch printer driver: one label per page, page sized to the tape.
+async function printLabels(canvases, tape) {
+  const height = Labels.TAPES[tape];
+  const length = Labels.mm(Math.max(...canvases.map((c) => c.width)));
+  const area = $("#print-area");
+  area.innerHTML =
+    `<style>@page { size: ${length}mm ${tape}mm; margin: 0; }</style>` +
+    canvases
+      .map(
+        (c) => `<div class="print-label" style="width:${length}mm;height:${tape}mm">
+          <img src="${c.toDataURL("image/png")}" style="width:${Labels.mm(c.width)}mm;height:${Labels.mm(height)}mm" alt=""></div>`
+      )
+      .join("");
+  await Promise.all($$("img", area).map((img) => img.decode().catch(() => {})));
+  window.print();
+}
+
+window.addEventListener("afterprint", () => ($("#print-area").innerHTML = ""));
+
 // --- navigation ------------------------------------------------------------
 
 function setView() {
-  const view = location.hash.slice(1);
+  let view = location.hash.slice(1);
+  if (view.startsWith("scan/")) {
+    // Opened from a label's QR code (/s/CODE redirects here).
+    const code = decodeURIComponent(view.slice("scan/".length));
+    history.replaceState(null, "", `#${state.view}`);
+    view = state.view;
+    scan(code).catch((err) => showMessage(err.message, true));
+  }
   state.view = ["parts", "jobs", "locations", "history"].includes(view) ? view : "parts";
   $$(".view").forEach((s) => (s.hidden = s.id !== `view-${state.view}`));
   $$(".tabs button").forEach((b) => b.setAttribute("aria-selected", b.dataset.view === state.view));
@@ -806,13 +1135,27 @@ function setView() {
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => (location.hash = b.dataset.view)));
 window.addEventListener("hashchange", setView);
 
-// "/" focuses the search box on the current tab.
+// Handheld barcode scanners type the code quickly and press Enter. Catch that
+// anywhere outside a text box and look the code up. "/" focuses the search box.
+let scanBuffer = "";
+let scanTime = 0;
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "/" || ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || $("dialog[open]")) return;
-  const search = $(`#view-${state.view} .search`);
-  if (search) {
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) || $("#form-dialog").open) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const now = Date.now();
+  if (now - scanTime > 100) scanBuffer = "";
+  scanTime = now;
+  if (e.key === "Enter") {
+    if (scanBuffer.length >= 3) {
+      e.preventDefault();
+      scan(scanBuffer).catch((err) => showMessage(err.message, true));
+    }
+    scanBuffer = "";
+  } else if (e.key === "/" && !scanBuffer && !$("dialog[open]") && $(`#view-${state.view} .search`)) {
     e.preventDefault();
-    search.focus();
+    $(`#view-${state.view} .search`).focus();
+  } else if (e.key.length === 1) {
+    scanBuffer += e.key;
   }
 });
 

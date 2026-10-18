@@ -4,11 +4,13 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from inventory.server import make_server
 from inventory.store import NotFound, Store, ValidationError
+from inventory.store import scanned_code as scanned
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
@@ -178,7 +180,76 @@ class LocationAndJobTests(StoreTestCase):
             s.delete_job(s.jobs()[0]["id"])
 
 
+class CategoryTests(StoreTestCase):
+    def test_categories(self):
+        s = self.store
+        s.update(self.res["id"], {"category": "Passives"})
+        s.update(self.cap["id"], {"category": "passives"})
+        s.update(self.mcu["id"], {"category": "Chips"})
+        self.assertEqual([(c["name"], c["parts"]) for c in s.categories()], [("Chips", 1), ("Passives", 2)])
+        self.assertEqual(self.pns(s.search(category="PASSIVES")), ["CAP-100U", "RES-10K"])
+        self.assertEqual(self.pns(s.search("chips")), ["MCU-328P"])
+        s.update(self.mcu["id"], {"category": ""})
+        self.assertEqual(self.pns(s.search(category="")), ["MCU-328P"])
+        new = s.create({"part_number": "N1", "category": " Tools "})
+        self.assertEqual(new["category"], "Tools")
+
+
+class CodeAndScanTests(StoreTestCase):
+    def loc(self, name):
+        return next(l for l in self.store.locations() if l["name"] == name)
+
+    def test_locations_get_codes(self):
+        codes = {l["name"]: l["code"] for l in self.store.locations()}
+        self.assertEqual(codes, {"Shelf A": "LOC-0001", "Shelf B": "LOC-0002", "Van 1": "LOC-0003"})
+        loc = self.store.create_location({"name": "Bin 9", "code": "BIN-9"})
+        self.assertEqual(loc["code"], "BIN-9")
+        with self.assertRaises(ValidationError):
+            self.store.create_location({"name": "Bin 10", "code": "bin-9"})
+        with self.assertRaises(ValidationError):
+            self.store.update_location(loc["id"], {"code": "has space"})
+        self.assertFalse(any(l["name"] == "Bin 10" for l in self.store.locations()))
+        # an auto code that is already taken gets a suffix
+        self.store.update_location(loc["id"], {"code": "LOC-0005"})
+        self.assertEqual(self.store.create_location({"name": "Bin 11"})["code"], "LOC-0005-1")
+
+    def test_location_contents(self):
+        loc = self.store.location_contents(self.loc("Shelf A")["id"])
+        self.assertEqual([(i["part_number"], i["here"], i["quantity"]) for i in loc["items"]],
+                         [("MCU-328P", 3, 5), ("RES-10K", 500, 500)])
+        self.assertEqual(loc["items"][0]["here_value"], 7500.0)
+
+    def test_scan(self):
+        s = self.store
+        shelf = self.loc("Shelf A")
+        for text in ("LOC-0001", "loc-0001", " http://192.168.1.5:8000/s/LOC-0001 ",
+                     "http://x/#scan/LOC-0001", "Shelf A"):
+            self.assertEqual(s.scan(text), {"type": "location", "id": shelf["id"], "code": scanned(text)}, text)
+        self.assertEqual(s.scan("res-10k")["type"], "part")
+        self.assertEqual(s.scan("http://x/s/RES-10K")["id"], self.res["id"])
+        s.create_job({"number": "J-77"})
+        self.assertEqual(s.scan("J-77")["type"], "job")
+        with self.assertRaises(NotFound):
+            s.scan("nope")
+        with self.assertRaises(ValidationError):
+            s.scan("  ")
+
+
 class ImportAndMigrationTests(StoreTestCase):
+    def test_migrates_version_2_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp, "v2.db"))
+            from inventory import store as store_module
+            old = sqlite3.connect(path)
+            old.executescript(f"BEGIN; {store_module.TABLES} PRAGMA user_version = 2; COMMIT;")
+            old.execute("INSERT INTO locations (name) VALUES ('Van'), ('Shed')")
+            old.commit()
+            old.close()
+            store = Store(path, uploads_dir=tmp)
+            self.assertEqual([(l["name"], l["code"]) for l in store.locations()], [("Shed", "LOC-0002"), ("Van", "LOC-0001")])
+            self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            store.conn.close()
+
     def test_import_upserts_stock_per_location(self):
         result = self.store.import_rows([
             {"part_number": "RES-10K", "location": "Shelf A", "quantity": "1000", "unit_value": "0.01"},
@@ -210,9 +281,16 @@ class ImportAndMigrationTests(StoreTestCase):
             items = store.search()
             self.assertEqual([(i["part_number"], i["quantity"]) for i in items], [("A-1", 10), ("B-2", 0)])
             self.assertEqual(items[0]["locations"][0]["name"], "Main")
+            self.assertEqual(items[0]["category"], "")
+            self.assertEqual(store.locations()[0]["code"], "LOC-0001")
             self.assertEqual(store.summary()["total_value"], 25.0)
             store.conn.close()
             Store(path, uploads_dir=tmp).conn.close()  # opening again is a no-op
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 
 class ApiTests(unittest.TestCase):
@@ -291,14 +369,42 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(self.json("DELETE", f"/api/items/{item['id']}/image")["image_url"])
 
     def test_csv_round_trip(self):
-        csv_text = "Part_Number,Description,Location,Quantity,Unit_Value\nP1,\"Bolt, M3\",Bin 1,10,0.05\nP1,,Bin 2,4,\nP2,Nut,,20,0.02\n"
+        csv_text = ("Part_Number,Description,Category,Location,Quantity,Unit_Value\n"
+                    "P1,\"Bolt, M3\",Fasteners,Bin 1,10,0.05\nP1,,,Bin 2,4,\nP2,Nut,,,20,0.02\n")
         status, body = self.request("POST", "/api/import", raw=csv_text.encode())
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["created"], 2)
         status, body = self.request("GET", "/api/export.csv")
-        self.assertIn('P1,"Bolt, M3",Bin 1,10,0.05,0.5', body)
-        self.assertIn('P1,"Bolt, M3",Bin 2,4,0.05,0.2', body)
-        self.assertIn("P2,Nut,Main,20,0.02,0.4", body)
+        self.assertIn('P1,"Bolt, M3",Fasteners,Bin 1,10,0.05,0.5', body)
+        self.assertIn('P1,"Bolt, M3",Fasteners,Bin 2,4,0.05,0.2', body)
+        self.assertIn("P2,Nut,,Main,20,0.02,0.4", body)
+        status, body = self.request("GET", "/api/export.csv?category=Fasteners")
+        self.assertNotIn("P2", body)
+
+    def test_scan_labels_and_short_links(self):
+        self.json("POST", "/api/items", {"part_number": "ABC/1", "category": "Widgets", "quantity": 3, "location": "Tote 1"}, 201)
+        loc = self.json("GET", "/api/locations")[0]
+        self.assertEqual(loc["code"], "LOC-0001")
+        self.assertEqual(self.json("GET", "/api/scan?code=" + urllib.parse.quote("http://h:1/s/LOC-0001")),
+                         {"type": "location", "id": loc["id"], "code": "LOC-0001"})
+        self.assertEqual(self.request("GET", "/api/scan?code=zzz")[0], 404)
+        detail = self.json("GET", f"/api/locations/{loc['id']}")
+        self.assertEqual(detail["items"][0]["here"], 3)
+        self.assertEqual(self.json("GET", "/api/categories"), [{"name": "Widgets", "parts": 1}])
+        self.assertIn("lan_url", self.json("GET", "/api/info"))
+
+        status, body = self.request("GET", "/api/labels.csv?type=locations&base=http://10.0.0.2:8000/")
+        self.assertTrue(body.startswith("\ufeffcode,name,notes,link,contents"))
+        self.assertIn("LOC-0001,Tote 1,,http://10.0.0.2:8000/s/LOC-0001,ABC/1 x3", body)
+        status, body = self.request("GET", "/api/labels.csv?type=parts&base=http://h")
+        self.assertIn("ABC/1,ABC/1,,Widgets,http://h/s/ABC%2F1", body)
+
+        # Short links redirect to the page, which looks the code up
+        opener = urllib.request.build_opener(NoRedirect)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            opener.open(self.base + "/s/ABC%2F1")
+        self.assertEqual(ctx.exception.code, 302)
+        self.assertEqual(ctx.exception.headers["Location"], "/#scan/ABC%2F1")
 
     def test_serves_ui_and_blocks_traversal(self):
         status, body = self.request("GET", "/")
