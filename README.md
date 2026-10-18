@@ -42,6 +42,29 @@ quantities and value, and book parts out or add stock right there. Each location
 
 Works on phones as well as desktops.
 
+## Sign-in and backups
+
+Everyone signs in with their own username and password. The History tab shows who received, booked
+out or moved stock. Tap your name (top right) to:
+
+- add or remove people;
+- change your password;
+- sign out;
+- **download a backup**: a zip of all data and pictures.
+
+![Account menu](docs/account.png)
+
+- Passwords are stored hashed (PBKDF2), and a sign-in lasts 30 days.
+- After 10 wrong passwords from one address, sign-in is blocked for 15 minutes.
+- The very first account is created in the browser, but only on the computer running the app.
+  Alternatively, run `python3 run.py --set-password YOUR_NAME`, which also resets a forgotten password.
+
+## Hosting online
+
+To use it from your phone anywhere, see **[Hosting on Google Cloud](docs/google-cloud.md)**. It's a
+step-by-step guide for the free e2-micro server, with HTTPS via Caddy and a free DuckDNS address.
+Setup scripts are in `deploy/`.
+
 ## Barcode labels and scanning
 
 Use **Print label** on a location or part, or **Print labels** on the Locations or Parts tab for
@@ -98,7 +121,7 @@ Requires Python 3.8+ and nothing else.
 python3 run.py
 ```
 
-Then open <http://127.0.0.1:8000>.
+Then open <http://127.0.0.1:8000> and create your account.
 
 Options:
 
@@ -106,6 +129,8 @@ Options:
 python3 run.py --port 9000 --db /path/to/my-inventory.db
 python3 run.py --host 0.0.0.0     # reachable from phones/other computers on your network (needed for QR scanning)
 python3 run.py --uploads /path/to/pictures
+python3 run.py --set-password sam  # add a person or reset their password, then exit
+python3 run.py --backup backups/   # write a backup zip, then exit (keeps the newest 14)
 ```
 
 Data is stored in `inventory.db` and pictures in an `uploads/` folder next to it. Back up both.
@@ -131,8 +156,17 @@ MCU-328P,ATmega328P microcontroller,Microcontrollers,Shelf B,12,2.85
 
 ## API
 
+Everything except the sign-in routes needs a signed-in session. Requests that change data must send
+the header `X-Requested-With: inventory`, which protects against forged cross-site requests.
+
 | Method | Path | Description |
 | --- | --- | --- |
+| GET | `/api/session` | Who is signed in (`user`), and whether the first account still needs creating |
+| POST | `/api/login` / `/api/logout` | `{username, password}`. Sets or clears the session cookie |
+| POST | `/api/setup` | Create the first account (only on the computer running the app, only when there are none) |
+| GET / POST / DELETE | `/api/users`, `/api/users/{id}` | List, add (`{username, password}`) or remove people |
+| POST | `/api/password` | `{current, new}`: change your password (signs out your other devices) |
+| GET | `/api/backup.zip` | Download a backup of all data and pictures |
 | GET | `/api/items?q=&sort=&order=&location_id=&category=` | Search parts, with stock per location and summary totals (`category=__none__` for uncategorised) |
 | POST | `/api/items` | Create a part (`part_number`, `description`, `category`, `unit_value`, optional `quantity` + `location`) |
 | GET / PUT / DELETE | `/api/items/{id}` | Get, update or delete a part |

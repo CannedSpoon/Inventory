@@ -20,7 +20,7 @@ const KIND_LABELS = { receive: "Received", book_out: "Booked out", return: "Retu
 // --- helpers ---------------------------------------------------------------
 
 async function api(method, path, body, contentType) {
-  const opts = { method, headers: {} };
+  const opts = { method, headers: { "X-Requested-With": "inventory" } };
   if (body !== undefined) {
     opts.body = contentType ? body : JSON.stringify(body);
     opts.headers["Content-Type"] = contentType || "application/json";
@@ -28,6 +28,7 @@ async function api(method, path, body, contentType) {
   const res = await fetch(path, opts);
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({ error: res.statusText }));
+  if (res.status === 401 && !path.startsWith("/api/login")) showLogin();
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -349,6 +350,7 @@ function historyRows(rows, showPart, q = "") {
       <td class="num">${signed(h.quantity)}</td>
       <td class="num">${money.format(Math.abs(h.value))}</td>
       <td class="desc">${highlight(h.note, q)}</td>
+      <td>${highlight(h.user_name, q)}</td>
     </tr>`
     )
     .join("");
@@ -381,7 +383,7 @@ function fieldHtml(f) {
     f.placeholder ? `placeholder="${esc(f.placeholder)}"` : "",
     f.readonly ? "readonly" : "",
     f.autofocus ? "autofocus" : "",
-    `autocomplete="off"`,
+    f.type === "password" ? "" : `autocomplete="off"`,
   ].join(" ");
   let input;
   if (f.type === "textarea") input = `<textarea ${attrs} rows="3">${esc(f.value)}</textarea>`;
@@ -389,7 +391,7 @@ function fieldHtml(f) {
     input = `<select ${attrs}>${(f.options || [])
       .map((o) => `<option value="${esc(o.value)}"${o.value === f.value ? " selected" : ""}>${esc(o.label)}</option>`)
       .join("")}</select>`;
-  else input = `<input type="${f.type || "text"}" ${attrs} value="${esc(f.value ?? "")}">`;
+  else input = `<input type="${f.type || "text"}" ${attrs} value="${esc(f.value ?? "")}"${f.type === "password" ? ' autocomplete="new-password"' : ""}>`;
   return `<label data-field="${f.name}">${esc(f.label)}${input}${f.hint ? `<small>${esc(f.hint)}</small>` : ""}</label>`;
 }
 
@@ -633,7 +635,7 @@ async function openPart(id) {
         <h3>History</h3>
         ${history.length
           ? `<div class="table-wrap"><table>
-              <thead><tr><th>When</th><th>Action</th><th>Location</th><th>Job</th><th class="num">Qty</th><th class="num">Value</th><th>Note</th></tr></thead>
+              <thead><tr><th>When</th><th>Action</th><th>Location</th><th>Job</th><th class="num">Qty</th><th class="num">Value</th><th>Note</th><th>By</th></tr></thead>
               <tbody>${historyRows(history, false)}</tbody></table></div>`
           : `<p class="muted">No movements yet.</p>`}
       </div>`;
@@ -777,7 +779,7 @@ async function openJob(id) {
         <h3>History</h3>
         ${job.history.length
           ? `<div class="table-wrap"><table>
-              <thead><tr><th>When</th><th>Action</th><th>P/N</th><th>Location</th><th>Job</th><th class="num">Qty</th><th class="num">Value</th><th>Note</th></tr></thead>
+              <thead><tr><th>When</th><th>Action</th><th>P/N</th><th>Location</th><th>Job</th><th class="num">Qty</th><th class="num">Value</th><th>Note</th><th>By</th></tr></thead>
               <tbody>${historyRows(job.history, true)}</tbody></table></div>`
           : `<p class="muted">Nothing booked yet.</p>`}
       </div>`;
@@ -1115,9 +1117,147 @@ async function printLabels(canvases, tape) {
 
 window.addEventListener("afterprint", () => ($("#print-area").innerHTML = ""));
 
+// --- signing in ------------------------------------------------------------
+
+let setupMode = false;
+
+function showLogin(session = {}) {
+  state.user = null;
+  $$("dialog[open]").forEach((d) => d.close());
+  document.body.classList.add("signed-out");
+  const form = $("#login-form");
+  setupMode = !!(session.needs_setup && session.can_setup);
+  $("#confirm-row").hidden = !setupMode;
+  form.elements.confirm.required = setupMode;
+  $("button[type=submit]", form).textContent = setupMode ? "Create account" : "Sign in";
+  form.elements.password.autocomplete = setupMode ? "new-password" : "current-password";
+  $("#login-intro").textContent = setupMode
+    ? "Welcome! Create the first account. You can add more people afterwards."
+    : session.needs_setup
+      ? "No accounts yet. On the computer running the app, run: python3 run.py --set-password YOUR_NAME"
+      : "Sign in to continue.";
+  form.elements.username.focus();
+}
+
+$("#login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const f = form.elements;
+  const box = $(".error", form);
+  box.hidden = true;
+  try {
+    if (setupMode && f.password.value !== f.confirm.value) throw new Error("Passwords don't match");
+    const body = { username: f.username.value, password: f.password.value };
+    const { user } = await api("POST", setupMode ? "/api/setup" : "/api/login", body);
+    form.reset();
+    signedIn(user);
+  } catch (err) {
+    box.textContent = err.message;
+    box.hidden = false;
+  }
+});
+
+function signedIn(user) {
+  state.user = user;
+  document.body.classList.remove("signed-out");
+  $("#account-btn").textContent = user.username;
+  setView();
+}
+
+async function start() {
+  try {
+    const session = await api("GET", "/api/session");
+    if (session.user) signedIn(session.user);
+    else showLogin(session);
+  } catch (err) {
+    showLogin();
+    const box = $("#login-form .error");
+    box.textContent = `Can't reach the server: ${err.message}`;
+    box.hidden = false;
+  }
+}
+
+// --- account, users and backup ---------------------------------------------
+
+async function accountDialog() {
+  const users = await api("GET", "/api/users");
+  formDialog({
+    title: `Signed in as ${state.user.username}`,
+    wide: true,
+    intro: `
+      <div class="button-row">
+        <a class="button" href="/api/backup.zip">Download backup</a>
+        <button type="button" data-act="logout">Sign out</button>
+      </div>
+      <p class="muted small">The backup is a zip of all your data and pictures. Keep a copy somewhere safe.</p>
+      <h3>People who can sign in</h3>
+      <table class="users">${users
+        .map(
+          (u) => `<tr><td><b>${esc(u.username)}</b></td><td class="muted">added ${when(u.created_at, false)}</td>
+            <td class="actions">${u.id === state.user.id
+              ? `<span class="muted">you</span>`
+              : `<button type="button" data-remove="${u.id}" data-name="${esc(u.username)}">Remove</button>`}</td></tr>`
+        )
+        .join("")}</table>
+      <div><button type="button" data-act="add-user">+ Add person</button></div>
+      <h3>Change your password</h3>`,
+    fields: [
+      { name: "current", label: "Current password", type: "password", required: true },
+      { name: "new", label: "New password (at least 8 characters)", type: "password", required: true, min: undefined },
+      { name: "repeat", label: "Repeat new password", type: "password", required: true },
+    ],
+    submitLabel: "Change password",
+    setup: (form) => {
+      form.addEventListener("click", async (e) => {
+        const btn = e.target.closest("button");
+        if (!btn) return;
+        try {
+          if (btn.dataset.act === "logout") {
+            await api("POST", "/api/logout");
+            showLogin();
+          } else if (btn.dataset.act === "add-user") {
+            addUserDialog();
+          } else if (btn.dataset.remove) {
+            if (!confirm(`Remove ${btn.dataset.name}? They won't be able to sign in any more.`)) return;
+            await api("DELETE", `/api/users/${btn.dataset.remove}`);
+            showMessage(`Removed ${btn.dataset.name}.`);
+            accountDialog();
+          }
+        } catch (err) {
+          showMessage(err.message, true);
+        }
+      });
+    },
+    onSubmit: async (data) => {
+      if (data.new !== data.repeat) throw new Error("The new passwords don't match");
+      await api("POST", "/api/password", { current: data.current, new: data.new });
+      showMessage("Password changed. Any other devices have been signed out.");
+    },
+  });
+}
+
+function addUserDialog() {
+  formDialog({
+    title: "Add person",
+    intro: `<p class="muted">They'll sign in with this username and password, and can change the password themselves.</p>`,
+    fields: [
+      { name: "username", label: "Username", required: true, autofocus: true, placeholder: "e.g. sam" },
+      { name: "password", label: "Password (at least 8 characters)", type: "password", required: true },
+    ],
+    submitLabel: "Add",
+    onSubmit: async (data) => {
+      const user = await api("POST", "/api/users", data);
+      showMessage(`Added ${user.username}.`);
+    },
+  });
+}
+
+$("#account-btn").addEventListener("click", () => accountDialog().catch((err) => showMessage(err.message, true)));
+
 // --- navigation ------------------------------------------------------------
 
 function setView() {
+  if (!state.user) return; // the hash (e.g. a scanned label) is handled after signing in
   let view = location.hash.slice(1);
   if (view.startsWith("scan/")) {
     // Opened from a label's QR code (/s/CODE redirects here).
@@ -1159,4 +1299,4 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-setView();
+start();

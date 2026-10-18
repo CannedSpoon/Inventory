@@ -6,11 +6,24 @@
   <title>Inventory</title>
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="signed-out">
+  <section id="login-screen">
+    <form id="login-form" class="login-card">
+      <h1>Inventory</h1>
+      <p id="login-intro" class="muted">Sign in to continue.</p>
+      <label>Username <input name="username" autocomplete="username" autocapitalize="none" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <label id="confirm-row" hidden>Repeat password <input name="confirm" type="password" autocomplete="new-password"></label>
+      <p class="error" hidden></p>
+      <button type="submit" class="primary">Sign in</button>
+    </form>
+  </section>
+
   <header>
     <div class="brand">
       <h1>Inventory</h1>
       <button id="scan-btn" class="primary" title="Scan or type a label code">Scan</button>
+      <button id="account-btn" title="Account, users and backup"></button>
     </div>
     <div class="stats">
       <div><span id="stat-items">0</span><label>Parts</label></div>
@@ -113,7 +126,7 @@
           <thead>
             <tr>
               <th>When</th><th>Action</th><th>P/N</th><th>Location</th><th>Job</th>
-              <th class="num">Qty</th><th class="num">Value</th><th>Note</th>
+              <th class="num">Qty</th><th class="num">Value</th><th>Note</th><th>By</th>
             </tr>
           </thead>
           <tbody id="history-rows"></tbody>

@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily backup of the inventory tracker
+
+[Service]
+Type=oneshot
+User=inventory
+Group=inventory
+ExecStart=/usr/bin/python3 @APP_DIR@/run.py --db /var/lib/inventory/inventory.db --uploads /var/lib/inventory/uploads --backup /var/lib/inventory/backups --keep 14
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/inventory

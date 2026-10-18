@@ -2,17 +2,25 @@
 
 import argparse
 import csv
+import getpass
 import io
 import json
 import mimetypes
 import re
+import shutil
 import socket
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from .store import NotFound, Store, ValidationError
+from .store import SESSION_DAYS, NotFound, Store, ValidationError
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 CSV_FIELDS = ["part_number", "description", "category", "location", "quantity", "unit_value", "total_value"]
@@ -33,6 +41,15 @@ STOCK_ACTIONS = {
 
 ROUTES = [
     # (method, pattern, handler name)
+    ("GET", r"/api/session", "get_session"),
+    ("POST", r"/api/login", "login"),
+    ("POST", r"/api/logout", "logout"),
+    ("POST", r"/api/setup", "first_account"),
+    ("GET", r"/api/users", "list_users"),
+    ("POST", r"/api/users", "create_user"),
+    ("DELETE", r"/api/users/(\d+)", "delete_user"),
+    ("POST", r"/api/password", "change_password"),
+    ("GET", r"/api/backup\.zip", "backup"),
     ("GET", r"/api/items", "list_items"),
     ("POST", r"/api/items", "create_item"),
     ("GET", r"/api/items/(\d+)", "get_item"),
@@ -63,6 +80,42 @@ ROUTES = [
     ("POST", r"/api/import", "import_items"),
 ]
 ROUTES = [(m, re.compile(f"^{p}$"), h) for m, p, h in ROUTES]
+PUBLIC_ROUTES = {"get_session", "login", "logout", "first_account"}  # everything else needs a signed-in user
+COOKIE = "inventory_session"
+
+
+class LoginLimiter:
+    """Refuse logins from an address after too many recent failures."""
+
+    def __init__(self, attempts=10, window=15 * 60):
+        self.attempts, self.window = attempts, window
+        self.failures = {}
+        self.lock = threading.Lock()
+
+    def _recent(self, key):
+        cutoff = time.monotonic() - self.window
+        times = [t for t in self.failures.get(key, []) if t > cutoff]
+        if times:
+            self.failures[key] = times
+        else:
+            self.failures.pop(key, None)
+        return times
+
+    def blocked_for(self, key):
+        """Seconds until this address may try again (0 if it may now)."""
+        with self.lock:
+            times = self._recent(key)
+            if len(times) < self.attempts:
+                return 0
+            return int(times[0] + self.window - time.monotonic()) + 1
+
+    def failed(self, key):
+        with self.lock:
+            self.failures.setdefault(key, []).append(time.monotonic())
+
+    def succeeded(self, key):
+        with self.lock:
+            self.failures.pop(key, None)
 
 
 def lan_address():
@@ -83,7 +136,9 @@ def to_csv(fields, rows):
     return buf.getvalue()
 
 
-def make_handler(store):
+def make_handler(store, behind_proxy=False):
+    limiter = LoginLimiter()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -97,6 +152,10 @@ def make_handler(store):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "same-origin")
+            if content_type == "application/json":
+                self.send_header("Cache-Control", "no-store")
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -124,6 +183,32 @@ def make_handler(store):
                 raise ValidationError("Expected a JSON object")
             return data
 
+        # --- sign-in helpers ---------------------------------------------
+        def client_ip(self):
+            forwarded = self.headers.get("X-Forwarded-For")
+            if behind_proxy and forwarded:
+                return forwarded.split(",")[-1].strip()  # the address our proxy saw
+            return self.client_address[0]
+
+        def is_https(self):
+            return behind_proxy and self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+        def session_token(self):
+            try:
+                morsel = SimpleCookie(self.headers.get("Cookie", "")).get(COOKIE)
+            except CookieError:
+                return None
+            return morsel.value if morsel else None
+
+        def session_cookie(self, token, max_age):
+            secure = "; Secure" if self.is_https() else ""
+            return {"Set-Cookie": f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"}
+
+        def can_setup(self):
+            """The first account can be created in the browser only on the computer running the app."""
+            local = not behind_proxy and self.client_address[0] in ("127.0.0.1", "::1")
+            return local and store.user_count() == 0
+
         def handle_request(self, method):
             url = urlparse(self.path)
             self.query = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -131,12 +216,21 @@ def make_handler(store):
                 # Short link printed in label QR codes; the page looks the code up.
                 code = unquote(url.path[len("/s/"):])
                 return self.send(HTTPStatus.FOUND, "", "text/plain", {"Location": "/#scan/" + quote(code, safe="")})
+            self.user = store.session_user(self.session_token())
+            store.local.user = self.user["username"] if self.user else None
+            # Browsers won't send this header cross-site without permission, which blocks forged requests.
+            if method != "GET" and self.headers.get("X-Requested-With") != "inventory":
+                return self.error(HTTPStatus.FORBIDDEN, "Missing X-Requested-With header")
             try:
                 for route_method, pattern, name in ROUTES:
                     if route_method == method and (m := pattern.match(url.path)):
+                        if name not in PUBLIC_ROUTES and not self.user:
+                            return self.error(HTTPStatus.UNAUTHORIZED, "Please sign in")
                         args = [int(a) if a.isdigit() else a for a in m.groups()]
                         return getattr(self, name)(*args)
                 if method == "GET" and not url.path.startswith("/api/"):
+                    if url.path.startswith("/uploads/") and not self.user:
+                        return self.error(HTTPStatus.UNAUTHORIZED, "Please sign in")
                     return self.serve_file(unquote(url.path))
                 self.error(HTTPStatus.NOT_FOUND, "Not found")
             except ValidationError as e:
@@ -157,6 +251,68 @@ def make_handler(store):
 
         def do_DELETE(self):
             self.handle_request("DELETE")
+
+        # --- accounts ----------------------------------------------------
+        def get_session(self):
+            needs_setup = store.user_count() == 0
+            self.send(HTTPStatus.OK, {"user": self.user, "needs_setup": needs_setup,
+                                      "can_setup": needs_setup and self.can_setup()})
+
+        def login(self):
+            ip = self.client_ip()
+            wait = limiter.blocked_for(ip)
+            if wait:
+                return self.error(HTTPStatus.TOO_MANY_REQUESTS,
+                                  f"Too many failed sign-ins. Try again in {wait // 60 + 1} minutes.")
+            data = self.json_body()
+            user = store.authenticate(data.get("username"), data.get("password"))
+            if not user:
+                limiter.failed(ip)
+                return self.error(HTTPStatus.UNAUTHORIZED, "Wrong username or password")
+            limiter.succeeded(ip)
+            token = store.create_session(user["id"])
+            self.send(HTTPStatus.OK, {"user": user}, headers=self.session_cookie(token, SESSION_DAYS * 86400))
+
+        def logout(self):
+            store.delete_session(self.session_token())
+            self.send(HTTPStatus.OK, {"user": None}, headers=self.session_cookie("", 0))
+
+        def first_account(self):
+            if not self.can_setup():
+                return self.error(HTTPStatus.FORBIDDEN, "Accounts can only be created by a signed-in user")
+            data = self.json_body()
+            store.set_password(data.get("username"), data.get("password"), create="only")
+            user = store.authenticate(data.get("username"), data.get("password"))
+            token = store.create_session(user["id"])
+            self.send(HTTPStatus.CREATED, {"user": user}, headers=self.session_cookie(token, SESSION_DAYS * 86400))
+
+        def list_users(self):
+            self.send(HTTPStatus.OK, store.users())
+
+        def create_user(self):
+            self.send(HTTPStatus.CREATED, store.create_user(self.json_body()))
+
+        def delete_user(self, user_id):
+            store.delete_user(user_id, self.user["id"])
+            self.send(HTTPStatus.NO_CONTENT)
+
+        def change_password(self):
+            data = self.json_body()
+            store.change_password(self.user["id"], data.get("current"), data.get("new"), keep_token=self.session_token())
+            self.send(HTTPStatus.OK, {"ok": True})
+
+        def backup(self):
+            with tempfile.TemporaryFile() as f:
+                store.write_backup(f)
+                size = f.tell()
+                f.seek(0)
+                name = f"inventory-backup-{datetime.now():%Y-%m-%d}.zip"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.end_headers()
+                shutil.copyfileobj(f, self.wfile)
 
         # --- parts -------------------------------------------------------
         def list_items(self):
@@ -314,8 +470,33 @@ def make_handler(store):
     return Handler
 
 
-def make_server(host="127.0.0.1", port=8000, db="inventory.db", uploads=None):
-    return ThreadingHTTPServer((host, port), make_handler(Store(db, uploads)))
+def make_server(host="127.0.0.1", port=8000, db="inventory.db", uploads=None, behind_proxy=False):
+    store = Store(db, uploads)
+    server = ThreadingHTTPServer((host, port), make_handler(store, behind_proxy))
+    server.store = store
+    return server
+
+
+def set_password_cli(store, username):
+    password = getpass.getpass(f"New password for {username}: ")
+    if getpass.getpass("Repeat it: ") != password:
+        sys.exit("Passwords don't match.")
+    try:
+        store.set_password(username, password)
+    except ValidationError as e:
+        sys.exit(str(e))
+    print(f"Password set for {username}.")
+
+
+def backup_cli(store, folder, keep):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"inventory-backup-{datetime.now():%Y-%m-%d-%H%M%S}.zip"
+    with open(path, "wb") as f:
+        store.write_backup(f)
+    for old in sorted(folder.glob("inventory-backup-*.zip"))[:-keep]:
+        old.unlink()
+    print(f"Backup written to {path}")
 
 
 def main():
@@ -324,9 +505,25 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--db", default="inventory.db", help="SQLite database file (default: inventory.db)")
     parser.add_argument("--uploads", help="Folder for part pictures (default: 'uploads' next to the database)")
+    parser.add_argument("--behind-proxy", action="store_true",
+                        help="Running behind a reverse proxy such as Caddy: trust its X-Forwarded-* headers")
+    parser.add_argument("--set-password", metavar="USERNAME",
+                        help="Create a user, or reset their password, then exit")
+    parser.add_argument("--backup", metavar="FOLDER", help="Write a backup zip to FOLDER, then exit")
+    parser.add_argument("--keep", type=int, default=14, help="Backups to keep with --backup (default: 14)")
     args = parser.parse_args()
-    server = make_server(args.host, args.port, args.db, args.uploads)
+    if args.set_password or args.backup:
+        store = Store(args.db, args.uploads)
+        if args.set_password:
+            set_password_cli(store, args.set_password)
+        if args.backup:
+            backup_cli(store, args.backup, max(args.keep, 1))
+        return
+    server = make_server(args.host, args.port, args.db, args.uploads, args.behind_proxy)
     print(f"Inventory running at http://{args.host}:{args.port}  (database: {args.db})")
+    if not server.store.user_count():
+        print(f"No accounts yet: open http://127.0.0.1:{args.port} on this computer to create one,")
+        print(f"or run: python3 run.py --db {args.db} --set-password YOUR_NAME")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

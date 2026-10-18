@@ -5,15 +5,21 @@ movements table, and parts booked out to a job are movements linked to that job,
 so a job's parts list and value are derived from its movements.
 """
 
+import base64
+import hashlib
+import hmac
 import re
 import secrets
 import sqlite3
+import tempfile
 import threading
+import zipfile
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_LOCATION = "Main"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
@@ -113,6 +119,27 @@ UPDATE locations SET code = printf('LOC-%04d', id);
 CREATE UNIQUE INDEX locations_code ON locations(code COLLATE NOCASE);
 """
 
+# Version 4 adds user accounts, login sessions, and who made each stock movement.
+MIGRATE_V4 = """
+CREATE TABLE users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+);
+ALTER TABLE movements ADD COLUMN user_name TEXT NOT NULL DEFAULT '';
+"""
+
+SESSION_DAYS = 30
+PASSWORD_ITERATIONS = 240_000
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,50}$")
+
 CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,39}$")
 
 IMAGE_TYPES = [
@@ -195,6 +222,37 @@ def scanned_code(text):
     return text
 
 
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ITERATIONS)
+    b64 = lambda b: base64.b64encode(b).decode()
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${b64(salt)}${b64(digest)}"
+
+
+def verify_password(password, stored):
+    try:
+        scheme, iterations, salt, digest = stored.split("$")
+        if scheme != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(iterations))
+        return hmac.compare_digest(actual, base64.b64decode(digest))
+    except (ValueError, TypeError):
+        return False
+
+
+_DUMMY = []
+
+
+def _dummy_hash():
+    if not _DUMMY:
+        _DUMMY.append(hash_password(secrets.token_urlsafe()))
+    return _DUMMY[0]
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def _like(term):
     return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
@@ -213,6 +271,7 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.local = threading.local()  # .user: who is making changes on this request's thread
         base = Path.cwd() if path == ":memory:" else Path(path).resolve().parent
         self.uploads = Path(uploads_dir) if uploads_dir else base / "uploads"
         self._migrate()
@@ -226,6 +285,8 @@ class Store:
             self.conn.executescript(f"BEGIN; {script} PRAGMA user_version = 2; COMMIT;")
         if version < 3:
             self.conn.executescript(f"BEGIN; {MIGRATE_V3} PRAGMA user_version = 3; COMMIT;")
+        if version < 4:
+            self.conn.executescript(f"BEGIN; {MIGRATE_V4} PRAGMA user_version = 4; COMMIT;")
 
     @contextmanager
     def tx(self):
@@ -430,10 +491,11 @@ class Store:
             )
         self.conn.execute(
             """INSERT INTO movements (kind, item_id, part_number, description, location_id, location_name,
-                                      job_id, quantity, unit_value, note)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                      job_id, quantity, unit_value, note, user_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (kind, item_id, item["part_number"], item["description"], location["id"], location["name"],
-             job["id"] if job else None, delta, item["unit_value"], str(note or "").strip()[:500]),
+             job["id"] if job else None, delta, item["unit_value"], str(note or "").strip()[:500],
+             getattr(self.local, "user", None) or ""),
         )
         self.conn.execute("UPDATE items SET updated_at = datetime('now') WHERE id = ?", (item_id,))
 
@@ -506,13 +568,14 @@ class Store:
                 """(COALESCE(i.part_number, m.part_number) LIKE ? ESCAPE '\\'
                     OR COALESCE(i.description, m.description) LIKE ? ESCAPE '\\'
                     OR COALESCE(l.name, m.location_name) LIKE ? ESCAPE '\\'
-                    OR j.number LIKE ? ESCAPE '\\' OR m.note LIKE ? ESCAPE '\\' OR m.kind LIKE ? ESCAPE '\\')"""
+                    OR j.number LIKE ? ESCAPE '\\' OR m.note LIKE ? ESCAPE '\\' OR m.kind LIKE ? ESCAPE '\\'
+                    OR m.user_name LIKE ? ESCAPE '\\')"""
             )
-            params += [_like(term)] * 6
+            params += [_like(term)] * 7
         params.append(int(limit))
         with self.lock:
             rows = self.conn.execute(
-                f"""SELECT m.id, m.created_at, m.kind, m.item_id, m.quantity, m.unit_value, m.note,
+                f"""SELECT m.id, m.created_at, m.kind, m.item_id, m.quantity, m.unit_value, m.note, m.user_name,
                            COALESCE(i.part_number, m.part_number) AS part_number,
                            COALESCE(i.description, m.description) AS description,
                            COALESCE(l.name, m.location_name) AS location,
@@ -757,3 +820,115 @@ class Store:
             except ValidationError as e:
                 errors.append(f"Row {n}: {e}")
         return {"created": created, "updated": updated, "errors": errors}
+
+    # --- users and sessions ------------------------------------------------
+
+    def user_count(self):
+        with self.lock:
+            return self._one("SELECT COUNT(*) FROM users")[0]
+
+    def users(self):
+        with self.lock:
+            rows = self.conn.execute("SELECT id, username, created_at FROM users ORDER BY username COLLATE NOCASE")
+            return [dict(r) for r in rows]
+
+    def set_password(self, username, password, create=True):
+        """Set a user's password, creating the user if they don't exist (and create is True)."""
+        username = str(username or "").strip()
+        if not USERNAME_RE.match(username):
+            raise ValidationError("Username must be 1-50 letters, numbers, '.', '_', '@' or '-'")
+        password = str(password or "")
+        if len(password) < 8:
+            raise ValidationError("Password must be at least 8 characters")
+        if len(password) > 200:
+            raise ValidationError("Password must be 200 characters or fewer")
+        hashed = hash_password(password)
+        with self.tx():
+            row = self._one("SELECT id FROM users WHERE username = ?", (username,))
+            if row:
+                if create == "only":
+                    raise ValidationError(f"User '{username}' already exists")
+                self.conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed, row["id"]))
+                return row["id"]
+            if not create:
+                raise NotFound(f"No user named '{username}'")
+            return self.conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed)
+            ).lastrowid
+
+    def create_user(self, data):
+        user_id = self.set_password(data.get("username"), data.get("password"), create="only")
+        return next(u for u in self.users() if u["id"] == user_id)
+
+    def change_password(self, user_id, current, new, keep_token=None):
+        with self.lock:
+            row = self._one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if not row or not verify_password(str(current or ""), row["password_hash"]):
+            raise ValidationError("Current password is wrong")
+        self.set_password(row["username"], new, create=False)
+        with self.tx():  # sign out everywhere else
+            self.conn.execute(
+                "DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                (user_id, _token_hash(keep_token or "")),
+            )
+
+    def delete_user(self, user_id, acting_user_id):
+        with self.tx():
+            if user_id == acting_user_id:
+                raise ValidationError("You can't remove your own account")
+            if not self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount:
+                raise NotFound(f"User {user_id} not found")
+
+    def authenticate(self, username, password):
+        """The user for a username and password, or None."""
+        with self.lock:
+            row = self._one("SELECT * FROM users WHERE username = ?", (str(username or "").strip(),))
+        if row and verify_password(str(password or ""), row["password_hash"]):
+            return {"id": row["id"], "username": row["username"]}
+        if not row:
+            verify_password("x", _dummy_hash())  # take the same time whether or not the user exists
+        return None
+
+    def create_session(self, user_id):
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+        with self.tx():
+            self.conn.execute("DELETE FROM sessions WHERE expires_at < datetime('now')")
+            self.conn.execute(
+                "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                (_token_hash(token), user_id, expires.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+        return token
+
+    def session_user(self, token):
+        if not token:
+            return None
+        with self.lock:
+            row = self._one(
+                """SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+                   WHERE s.token_hash = ? AND s.expires_at > datetime('now')""",
+                (_token_hash(token),),
+            )
+        return dict(row) if row else None
+
+    def delete_session(self, token):
+        with self.tx():
+            self.conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token or ""),))
+
+    # --- backups -------------------------------------------------------------
+
+    def write_backup(self, fileobj):
+        """Write a zip of the database and all pictures to fileobj."""
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = sqlite3.connect(str(Path(tmp, "inventory.db")))
+            with self.lock:
+                self.conn.backup(copy)
+            copy.execute("DELETE FROM sessions")  # don't put login tokens in backups
+            copy.commit()
+            copy.close()
+            with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(Path(tmp, "inventory.db"), "inventory.db")
+                if self.uploads.is_dir():
+                    for f in sorted(self.uploads.iterdir()):
+                        if f.is_file():
+                            zf.write(f, f"uploads/{f.name}", compress_type=zipfile.ZIP_STORED)

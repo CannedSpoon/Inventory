@@ -1,0 +1,19 @@
+[Unit]
+Description=Inventory tracker
+After=network.target
+
+[Service]
+User=inventory
+Group=inventory
+WorkingDirectory=/var/lib/inventory
+ExecStart=/usr/bin/python3 @APP_DIR@/run.py --host 127.0.0.1 --port 8000 --db /var/lib/inventory/inventory.db --uploads /var/lib/inventory/uploads --behind-proxy
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/inventory
+
+[Install]
+WantedBy=multi-user.target

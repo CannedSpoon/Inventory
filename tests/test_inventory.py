@@ -1,5 +1,8 @@
+import http.cookiejar
+import io
 import json
 import sqlite3
+import zipfile
 import tempfile
 import threading
 import unittest
@@ -247,7 +250,7 @@ class ImportAndMigrationTests(StoreTestCase):
             old.close()
             store = Store(path, uploads_dir=tmp)
             self.assertEqual([(l["name"], l["code"]) for l in store.locations()], [("Shed", "LOC-0002"), ("Van", "LOC-0001")])
-            self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], store_module.SCHEMA_VERSION)
             store.conn.close()
 
     def test_import_upserts_stock_per_location(self):
@@ -293,33 +296,46 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class ApiTests(unittest.TestCase):
+class ServerTestCase(unittest.TestCase):
+    behind_proxy = False
+    sign_in = True
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.server = make_server("127.0.0.1", 0, ":memory:", self.tmp.name)
+        self.server = make_server("127.0.0.1", 0, ":memory:", self.tmp.name, behind_proxy=self.behind_proxy)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.opener = self.new_browser()
+        if self.sign_in:
+            self.server.store.set_password("tester", "password123")
+            self.assertEqual(self.request("POST", "/api/login", {"username": "tester", "password": "password123"})[0], 200)
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
         self.tmp.cleanup()
 
-    def request(self, method, path, body=None, raw=None):
+    def new_browser(self):
+        return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def request(self, method, path, body=None, raw=None, opener=None, headers=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-        req = urllib.request.Request(self.base + path, data=data, method=method)
+        hdrs = {"X-Requested-With": "inventory"} if headers is None else headers
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=hdrs)
         try:
-            with urllib.request.urlopen(req) as res:
+            with (opener or self.opener).open(req) as res:
                 text = res.read()
                 return res.status, text.decode(errors="replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def json(self, method, path, body=None, expect=200):
-        status, text = self.request(method, path, body)
+    def json(self, method, path, body=None, expect=200, opener=None):
+        status, text = self.request(method, path, body, opener=opener)
         self.assertEqual(status, expect, text)
         return json.loads(text) if text else None
 
+
+class ApiTests(ServerTestCase):
     def test_full_flow(self):
         item = self.json("POST", "/api/items", {"part_number": "ABC-1", "description": "Widget",
                                                 "unit_value": 2.5, "quantity": 4, "location": "Shelf A"}, 201)
@@ -361,7 +377,7 @@ class ApiTests(unittest.TestCase):
         status, text = self.request("POST", f"/api/items/{item['id']}/image", raw=PNG)
         self.assertEqual(status, 200, text)
         url = json.loads(text)["image_url"]
-        with urllib.request.urlopen(self.base + url) as res:
+        with self.opener.open(self.base + url) as res:
             self.assertEqual(res.headers["Content-Type"], "image/png")
             self.assertEqual(res.read(), PNG)
         status, _ = self.request("POST", f"/api/items/{item['id']}/image", raw=b"not an image")
@@ -414,6 +430,122 @@ class ApiTests(unittest.TestCase):
                      "/uploads/%2e%2e%2f%2e%2e%2fetc%2fpasswd"):
             status, _ = self.request("GET", path)
             self.assertEqual(status, 404, path)
+
+
+class AuthTests(ServerTestCase):
+    def test_everything_needs_sign_in(self):
+        anon = self.new_browser()
+        self.assertEqual(self.json("GET", "/api/session", opener=anon)["user"], None)
+        for method, path in (("GET", "/api/items"), ("GET", "/api/locations/1"), ("GET", "/api/backup.zip"),
+                             ("GET", "/api/export.csv"), ("POST", "/api/items"), ("GET", "/uploads/1-x.png")):
+            self.assertEqual(self.request(method, path, {} if method == "POST" else None, opener=anon)[0], 401, path)
+        self.assertEqual(self.request("GET", "/", opener=anon)[0], 200)
+        self.assertEqual(self.json("GET", "/api/session")["user"]["username"], "tester")
+
+    def test_changes_need_the_custom_header(self):
+        status, _ = self.request("POST", "/api/items", {"part_number": "X"}, headers={})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.request("POST", "/api/items", {"part_number": "X"})[0], 201)
+
+    def test_wrong_password_and_lockout(self):
+        anon = self.new_browser()
+        for _ in range(10):
+            status, _ = self.request("POST", "/api/login", {"username": "tester", "password": "nope"}, opener=anon)
+            self.assertEqual(status, 401)
+        status, body = self.request("POST", "/api/login", {"username": "tester", "password": "password123"}, opener=anon)
+        self.assertEqual(status, 429)
+        self.assertIn("Too many", body)
+
+    def test_logout(self):
+        self.json("POST", "/api/logout")
+        self.assertEqual(self.request("GET", "/api/items")[0], 401)
+
+    def test_users_and_passwords(self):
+        bob = self.json("POST", "/api/users", {"username": "bob", "password": "bobspassword"}, 201)
+        self.assertEqual(self.request("POST", "/api/users", {"username": "BOB", "password": "x" * 8})[0], 400)
+        self.assertEqual(self.request("POST", "/api/users", {"username": "eve", "password": "short"})[0], 400)
+        self.assertEqual([u["username"] for u in self.json("GET", "/api/users")], ["bob", "tester"])
+        me = self.json("GET", "/api/session")["user"]
+        self.assertEqual(self.request("DELETE", f"/api/users/{me['id']}")[0], 400)
+
+        # bob signs in elsewhere, then tester changes their own password: tester stays signed in here
+        other = self.new_browser()
+        self.json("POST", "/api/login", {"username": "tester", "password": "password123"}, opener=other)
+        self.assertEqual(self.request("POST", "/api/password", {"current": "wrong", "new": "newpassword1"})[0], 400)
+        self.json("POST", "/api/password", {"current": "password123", "new": "newpassword1"})
+        self.assertEqual(self.request("GET", "/api/items")[0], 200)
+        self.assertEqual(self.request("GET", "/api/items", opener=other)[0], 401)  # signed out elsewhere
+
+        self.json("DELETE", f"/api/users/{bob['id']}", expect=204)
+        self.assertEqual(self.request("POST", "/api/login", {"username": "bob", "password": "bobspassword"},
+                                      opener=self.new_browser())[0], 401)
+
+    def test_movements_record_who(self):
+        item = self.json("POST", "/api/items", {"part_number": "P1", "quantity": 2, "location": "Bin"}, 201)
+        self.json("POST", f"/api/items/{item['id']}/book-out", {"location": "Bin", "job": "J1", "quantity": 1})
+        self.assertEqual({h["user_name"] for h in self.json("GET", "/api/history")}, {"tester"})
+        self.assertEqual(len(self.json("GET", "/api/history?q=tester")), 2)
+
+    def test_backup_zip(self):
+        item = self.json("POST", "/api/items", {"part_number": "P1"}, 201)
+        self.request("POST", f"/api/items/{item['id']}/image", raw=PNG)
+        with self.opener.open(urllib.request.Request(self.base + "/api/backup.zip")) as res:
+            self.assertEqual(res.headers["Content-Type"], "application/zip")
+            zf = zipfile.ZipFile(io.BytesIO(res.read()))
+        names = zf.namelist()
+        self.assertIn("inventory.db", names)
+        self.assertTrue(any(n.startswith("uploads/1-") for n in names))
+        with tempfile.TemporaryDirectory() as tmp:
+            zf.extract("inventory.db", tmp)
+            db = sqlite3.connect(str(Path(tmp, "inventory.db")))
+            self.assertEqual(db.execute("SELECT part_number FROM items").fetchall(), [("P1",)])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            db.close()
+
+
+class FirstRunTests(ServerTestCase):
+    sign_in = False
+
+    def test_first_account_created_in_browser_on_this_computer(self):
+        session = self.json("GET", "/api/session")
+        self.assertEqual((session["needs_setup"], session["can_setup"]), (True, True))
+        self.assertEqual(self.request("POST", "/api/setup", {"username": "me", "password": "short"})[0], 400)
+        self.json("POST", "/api/setup", {"username": "me", "password": "longenough"}, 201)
+        self.assertEqual(self.json("GET", "/api/session")["user"]["username"], "me")
+        self.assertEqual(self.request("GET", "/api/items")[0], 200)
+        # only the very first account
+        self.assertEqual(self.request("POST", "/api/setup", {"username": "x", "password": "longenough"},
+                                      opener=self.new_browser())[0], 403)
+
+
+class BehindProxyTests(ServerTestCase):
+    behind_proxy = True
+    sign_in = False
+
+    def test_no_browser_setup_and_secure_cookie(self):
+        # Behind a proxy every request comes from 127.0.0.1, so browser setup must stay off.
+        self.assertFalse(self.json("GET", "/api/session")["can_setup"])
+        self.assertEqual(self.request("POST", "/api/setup", {"username": "me", "password": "longenough"})[0], 403)
+        self.server.store.set_password("me", "longenough")
+        req = urllib.request.Request(
+            self.base + "/api/login", data=json.dumps({"username": "me", "password": "longenough"}).encode(),
+            method="POST", headers={"X-Requested-With": "inventory", "X-Forwarded-Proto": "https",
+                                    "X-Forwarded-For": "203.0.113.9"})
+        with urllib.request.urlopen(req) as res:
+            cookie = res.headers["Set-Cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertIn("Secure", cookie)
+
+    def test_lockout_is_per_client_address(self):
+        self.server.store.set_password("me", "longenough")
+        def login(ip, password):
+            return self.request("POST", "/api/login", {"username": "me", "password": password}, opener=self.new_browser(),
+                                headers={"X-Requested-With": "inventory", "X-Forwarded-For": ip})[0]
+        for _ in range(10):
+            self.assertEqual(login("198.51.100.1", "wrong"), 401)
+        self.assertEqual(login("198.51.100.1", "longenough"), 429)
+        self.assertEqual(login("198.51.100.2", "longenough"), 200)
 
 
 if __name__ == "__main__":
