@@ -9,16 +9,58 @@ import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .store import NotFound, Store, ValidationError
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-CSV_FIELDS = ["part_number", "description", "quantity", "unit_value", "total_value"]
-MAX_BODY = 10 * 1024 * 1024
+CSV_FIELDS = ["part_number", "description", "location", "quantity", "unit_value", "total_value"]
+JOB_CSV_FIELDS = ["job", "part_number", "description", "quantity", "total_value"]
+MAX_BODY = 12 * 1024 * 1024
 
-ITEM_RE = re.compile(r"^/api/items/(\d+)$")
-ADJUST_RE = re.compile(r"^/api/items/(\d+)/adjust$")
+STOCK_ACTIONS = {
+    "receive": "receive",
+    "book-out": "book_out",
+    "return": "return_from_job",
+    "transfer": "transfer",
+    "count": "count",
+}
+
+ROUTES = [
+    # (method, pattern, handler name)
+    ("GET", r"/api/items", "list_items"),
+    ("POST", r"/api/items", "create_item"),
+    ("GET", r"/api/items/(\d+)", "get_item"),
+    ("PUT", r"/api/items/(\d+)", "update_item"),
+    ("DELETE", r"/api/items/(\d+)", "delete_item"),
+    ("GET", r"/api/items/(\d+)/history", "item_history"),
+    ("POST", r"/api/items/(\d+)/image", "upload_image"),
+    ("DELETE", r"/api/items/(\d+)/image", "delete_image"),
+    ("POST", r"/api/items/(\d+)/(receive|book-out|return|transfer|count)", "stock_action"),
+    ("GET", r"/api/locations", "list_locations"),
+    ("POST", r"/api/locations", "create_location"),
+    ("PUT", r"/api/locations/(\d+)", "update_location"),
+    ("DELETE", r"/api/locations/(\d+)", "delete_location"),
+    ("GET", r"/api/jobs", "list_jobs"),
+    ("POST", r"/api/jobs", "create_job"),
+    ("GET", r"/api/jobs/(\d+)", "get_job"),
+    ("PUT", r"/api/jobs/(\d+)", "update_job"),
+    ("DELETE", r"/api/jobs/(\d+)", "delete_job"),
+    ("GET", r"/api/jobs/(\d+)/export\.csv", "export_job"),
+    ("GET", r"/api/history", "history"),
+    ("GET", r"/api/summary", "summary"),
+    ("GET", r"/api/export\.csv", "export_items"),
+    ("POST", r"/api/import", "import_items"),
+]
+ROUTES = [(m, re.compile(f"^{p}$"), h) for m, p, h in ROUTES]
+
+
+def to_csv(fields, rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
 
 
 def make_handler(store):
@@ -40,13 +82,17 @@ def make_handler(store):
             self.end_headers()
             self.wfile.write(body)
 
+        def send_csv(self, text, filename):
+            self.send(HTTPStatus.OK, text, "text/csv; charset=utf-8",
+                      {"Content-Disposition": f'attachment; filename="{filename}"'})
+
         def error(self, status, message):
             self.send(status, {"error": message})
 
         def body(self):
             length = int(self.headers.get("Content-Length") or 0)
             if length > MAX_BODY:
-                raise ValidationError("Request body too large")
+                raise ValidationError("Upload is too large")
             return self.rfile.read(length)
 
         def json_body(self):
@@ -58,86 +104,146 @@ def make_handler(store):
                 raise ValidationError("Expected a JSON object")
             return data
 
-        def dispatch(self, fn):
+        def handle_request(self, method):
+            url = urlparse(self.path)
+            self.query = {k: v[0] for k, v in parse_qs(url.query).items()}
             try:
-                fn()
+                for route_method, pattern, name in ROUTES:
+                    if route_method == method and (m := pattern.match(url.path)):
+                        args = [int(a) if a.isdigit() else a for a in m.groups()]
+                        return getattr(self, name)(*args)
+                if method == "GET" and not url.path.startswith("/api/"):
+                    return self.serve_file(unquote(url.path))
+                self.error(HTTPStatus.NOT_FOUND, "Not found")
             except ValidationError as e:
                 self.error(HTTPStatus.BAD_REQUEST, str(e))
+            except ValueError:  # e.g. a non-numeric query parameter
+                self.error(HTTPStatus.BAD_REQUEST, "Invalid request")
             except NotFound as e:
                 self.error(HTTPStatus.NOT_FOUND, str(e))
 
-        # --- routes ------------------------------------------------------
         def do_GET(self):
-            self.dispatch(self._get)
+            self.handle_request("GET")
 
         def do_POST(self):
-            self.dispatch(self._post)
+            self.handle_request("POST")
 
         def do_PUT(self):
-            self.dispatch(self._put)
+            self.handle_request("PUT")
 
         def do_DELETE(self):
-            self.dispatch(self._delete)
+            self.handle_request("DELETE")
 
-        def _get(self):
-            url = urlparse(self.path)
-            qs = {k: v[0] for k, v in parse_qs(url.query).items()}
-            if url.path == "/api/items":
-                items = store.search(qs.get("q", ""), qs.get("sort", "part_number"), qs.get("order", "asc"))
-                return self.send(HTTPStatus.OK, {"items": items, "summary": store.summary()})
-            if m := ITEM_RE.match(url.path):
-                return self.send(HTTPStatus.OK, store.get(int(m[1])))
-            if url.path == "/api/export.csv":
-                buf = io.StringIO()
-                writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(store.search(qs.get("q", "")))
-                return self.send(
-                    HTTPStatus.OK, buf.getvalue(), "text/csv; charset=utf-8",
-                    {"Content-Disposition": 'attachment; filename="inventory.csv"'},
-                )
-            self.static(url.path)
+        # --- parts -------------------------------------------------------
+        def list_items(self):
+            q = self.query
+            items = store.search(q.get("q", ""), q.get("sort", "part_number"), q.get("order", "asc"),
+                                 q.get("location_id") or None)
+            self.send(HTTPStatus.OK, {"items": items, "summary": store.summary()})
 
-        def _post(self):
-            path = urlparse(self.path).path
-            if path == "/api/items":
-                return self.send(HTTPStatus.CREATED, store.create(self.json_body()))
-            if m := ADJUST_RE.match(path):
-                return self.send(HTTPStatus.OK, store.adjust(int(m[1]), self.json_body().get("delta")))
-            if path == "/api/import":
-                text = self.body().decode("utf-8-sig", errors="replace")
-                reader = csv.DictReader(io.StringIO(text))
-                if not reader.fieldnames or "part_number" not in [f.strip().lower() for f in reader.fieldnames]:
-                    raise ValidationError("CSV must have a header row including 'part_number'")
-                rows = [{(k or "").strip().lower(): v for k, v in row.items()} for row in reader]
-                return self.send(HTTPStatus.OK, store.import_rows(rows))
-            self.error(HTTPStatus.NOT_FOUND, "Not found")
+        def create_item(self):
+            self.send(HTTPStatus.CREATED, store.create(self.json_body()))
 
-        def _put(self):
-            if m := ITEM_RE.match(urlparse(self.path).path):
-                return self.send(HTTPStatus.OK, store.update(int(m[1]), self.json_body()))
-            self.error(HTTPStatus.NOT_FOUND, "Not found")
+        def get_item(self, item_id):
+            self.send(HTTPStatus.OK, store.get(item_id))
 
-        def _delete(self):
-            if m := ITEM_RE.match(urlparse(self.path).path):
-                store.delete(int(m[1]))
-                return self.send(HTTPStatus.NO_CONTENT)
-            self.error(HTTPStatus.NOT_FOUND, "Not found")
+        def update_item(self, item_id):
+            self.send(HTTPStatus.OK, store.update(item_id, self.json_body()))
 
-        def static(self, path):
-            if path == "/":
-                path = "/index.html"
-            file = (STATIC_DIR / path.lstrip("/")).resolve()
-            if STATIC_DIR not in file.parents or not file.is_file():
+        def delete_item(self, item_id):
+            store.delete(item_id)
+            self.send(HTTPStatus.NO_CONTENT)
+
+        def item_history(self, item_id):
+            store.get(item_id)
+            self.send(HTTPStatus.OK, store.history(item_id=item_id))
+
+        def upload_image(self, item_id):
+            self.send(HTTPStatus.OK, store.set_image(item_id, self.body()))
+
+        def delete_image(self, item_id):
+            self.send(HTTPStatus.OK, store.remove_image(item_id))
+
+        def stock_action(self, item_id, action):
+            self.send(HTTPStatus.OK, getattr(store, STOCK_ACTIONS[action])(item_id, self.json_body()))
+
+        def export_items(self):
+            rows = []
+            for item in store.search(self.query.get("q", ""), location_id=self.query.get("location_id") or None):
+                for loc in item["locations"] or [{"name": "", "quantity": 0}]:
+                    rows.append({**item, "location": loc["name"], "quantity": loc["quantity"],
+                                 "total_value": round(loc["quantity"] * item["unit_value"], 2)})
+            self.send_csv(to_csv(CSV_FIELDS, rows), "inventory.csv")
+
+        def import_items(self):
+            text = self.body().decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            if not reader.fieldnames or "part_number" not in [f.strip().lower() for f in reader.fieldnames]:
+                raise ValidationError("CSV must have a header row including 'part_number'")
+            rows = [{(k or "").strip().lower(): v for k, v in row.items()} for row in reader]
+            self.send(HTTPStatus.OK, store.import_rows(rows))
+
+        # --- locations ---------------------------------------------------
+        def list_locations(self):
+            self.send(HTTPStatus.OK, store.locations())
+
+        def create_location(self):
+            self.send(HTTPStatus.CREATED, store.create_location(self.json_body()))
+
+        def update_location(self, location_id):
+            self.send(HTTPStatus.OK, store.update_location(location_id, self.json_body()))
+
+        def delete_location(self, location_id):
+            store.delete_location(location_id)
+            self.send(HTTPStatus.NO_CONTENT)
+
+        # --- jobs --------------------------------------------------------
+        def list_jobs(self):
+            self.send(HTTPStatus.OK, store.jobs(self.query.get("q", ""), self.query.get("status", "")))
+
+        def create_job(self):
+            self.send(HTTPStatus.CREATED, store.create_job(self.json_body()))
+
+        def get_job(self, job_id):
+            self.send(HTTPStatus.OK, store.get_job(job_id))
+
+        def update_job(self, job_id):
+            self.send(HTTPStatus.OK, store.update_job(job_id, self.json_body()))
+
+        def delete_job(self, job_id):
+            store.delete_job(job_id)
+            self.send(HTTPStatus.NO_CONTENT)
+
+        def export_job(self, job_id):
+            job = store.get_job(job_id)
+            rows = [{**p, "job": job["number"]} for p in job["parts"]]
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", job["number"])
+            self.send_csv(to_csv(JOB_CSV_FIELDS, rows), f"job-{safe}.csv")
+
+        def summary(self):
+            self.send(HTTPStatus.OK, store.summary())
+
+        def history(self):
+            self.send(HTTPStatus.OK, store.history(query=self.query.get("q", ""),
+                                                   limit=min(int(self.query.get("limit") or 500), 5000)))
+
+        # --- files -------------------------------------------------------
+        def serve_file(self, path):
+            if path.startswith("/uploads/"):
+                root, rel = store.uploads.resolve(), path[len("/uploads/"):]
+            else:
+                root, rel = STATIC_DIR, ("index.html" if path == "/" else path.lstrip("/"))
+            file = (root / rel).resolve()
+            if root not in file.parents or not file.is_file():
                 return self.error(HTTPStatus.NOT_FOUND, "Not found")
             ctype = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
-            self.send(HTTPStatus.OK, file.read_bytes(), ctype)
+            self.send(HTTPStatus.OK, file.read_bytes(), ctype, {"X-Content-Type-Options": "nosniff"})
 
     return Handler
 
 
-def make_server(host="127.0.0.1", port=8000, db="inventory.db"):
-    return ThreadingHTTPServer((host, port), make_handler(Store(db)))
+def make_server(host="127.0.0.1", port=8000, db="inventory.db", uploads=None):
+    return ThreadingHTTPServer((host, port), make_handler(Store(db, uploads)))
 
 
 def main():
@@ -145,8 +251,9 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--db", default="inventory.db", help="SQLite database file (default: inventory.db)")
+    parser.add_argument("--uploads", help="Folder for part pictures (default: 'uploads' next to the database)")
     args = parser.parse_args()
-    server = make_server(args.host, args.port, args.db)
+    server = make_server(args.host, args.port, args.db, args.uploads)
     print(f"Inventory running at http://{args.host}:{args.port}  (database: {args.db})")
     try:
         server.serve_forever()
