@@ -16,6 +16,7 @@ from inventory.store import NotFound, Store, ValidationError
 from inventory.store import scanned_code as scanned
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+JPG = b"\xff\xd8\xff" + b"\x00" * 32
 
 
 class StoreTestCase(unittest.TestCase):
@@ -84,18 +85,39 @@ class PartTests(StoreTestCase):
         job = self.store.get_job(self.store.jobs()[0]["id"])
         self.assertEqual([(p["part_number"], p["quantity"]) for p in job["parts"]], [("CAP-100U", 4)])
 
-    def test_image_upload_replace_and_delete(self):
-        item = self.store.set_image(self.res["id"], PNG)
-        first = Path(self.tmp.name, item["image"])
-        self.assertTrue(first.exists())
-        self.assertTrue(item["image_url"].endswith(".png"))
-        item = self.store.set_image(self.res["id"], b"\xff\xd8\xff" + b"\x00" * 10)
-        self.assertFalse(first.exists())
-        self.assertTrue(item["image"].endswith(".jpg"))
+    def test_multiple_pictures(self):
+        s, rid = self.store, self.res["id"]
+        first = s.add_image(rid, PNG)
+        self.assertTrue(first["image_url"].endswith(".png"))
+        item = s.add_image(rid, JPG)
+        item = s.add_image(rid, PNG)
+        self.assertEqual(len(item["images"]), 3)
+        self.assertEqual(item["image_url"], first["image_url"])  # the first one stays the main picture
+        files = lambda: sorted(p.name for p in Path(self.tmp.name).iterdir())
+        self.assertEqual(len(files()), 3)
+
+        jpg = item["images"][1]
+        item = s.make_main_image(rid, jpg["id"])
+        self.assertEqual(item["image_url"], jpg["url"])
+        self.assertEqual([i["id"] for i in item["images"]][0], jpg["id"])
+
+        item = s.remove_image(rid, jpg["id"])
+        self.assertEqual(len(item["images"]), 2)
+        self.assertEqual(len(files()), 2)
+        self.assertEqual(item["image_url"], first["image_url"])
+        with self.assertRaises(NotFound):
+            s.remove_image(self.cap["id"], item["images"][0]["id"])  # belongs to another part
         with self.assertRaises(ValidationError):
-            self.store.set_image(self.res["id"], b"<script>alert(1)</script>")
-        self.store.delete(self.res["id"])
-        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+            s.add_image(rid, b"<script>alert(1)</script>")
+        s.delete(rid)
+        self.assertEqual(files(), [])
+
+    def test_picture_limit(self):
+        from inventory import store as store_module
+        for _ in range(store_module.MAX_IMAGES_PER_PART):
+            self.store.add_image(self.cap["id"], PNG)
+        with self.assertRaises(ValidationError):
+            self.store.add_image(self.cap["id"], PNG)
 
 
 class StockTests(StoreTestCase):
@@ -253,6 +275,23 @@ class ImportAndMigrationTests(StoreTestCase):
             self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], store_module.SCHEMA_VERSION)
             store.conn.close()
 
+    def test_migrates_single_picture_to_pictures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp, "v4.db"))
+            from inventory import store as store_module
+            old = sqlite3.connect(path)
+            old.executescript(f"BEGIN; {store_module.TABLES} PRAGMA user_version = 2; COMMIT;")
+            old.executescript(f"BEGIN; {store_module.MIGRATE_V3} {store_module.MIGRATE_V4} PRAGMA user_version = 4; COMMIT;")
+            old.execute("INSERT INTO items (part_number, image) VALUES ('A', '1-abc.png'), ('B', NULL)")
+            old.commit()
+            old.close()
+            store = Store(path, uploads_dir=tmp)
+            a, b = store.search()
+            self.assertEqual(a["images"][0]["url"], "/uploads/1-abc.png")
+            self.assertEqual(a["image_url"], "/uploads/1-abc.png")
+            self.assertEqual((b["images"], b["image_url"]), ([], None))
+            store.conn.close()
+
     def test_import_upserts_stock_per_location(self):
         result = self.store.import_rows([
             {"part_number": "RES-10K", "location": "Shelf A", "quantity": "1000", "unit_value": "0.01"},
@@ -374,15 +413,24 @@ class ApiTests(ServerTestCase):
 
     def test_image_upload_and_serving(self):
         item = self.json("POST", "/api/items", {"part_number": "P1"}, 201)
-        status, text = self.request("POST", f"/api/items/{item['id']}/image", raw=PNG)
+        iid = item["id"]
+        status, text = self.request("POST", f"/api/items/{iid}/images", raw=PNG)
         self.assertEqual(status, 200, text)
         url = json.loads(text)["image_url"]
         with self.opener.open(self.base + url) as res:
             self.assertEqual(res.headers["Content-Type"], "image/png")
             self.assertEqual(res.read(), PNG)
-        status, _ = self.request("POST", f"/api/items/{item['id']}/image", raw=b"not an image")
+        status, text = self.request("POST", f"/api/items/{iid}/images", raw=JPG)
+        images = json.loads(text)["images"]
+        self.assertEqual(len(images), 2)
+        item = self.json("POST", f"/api/items/{iid}/images/{images[1]['id']}/main")
+        self.assertEqual(item["image_url"], images[1]["url"])
+        status, _ = self.request("POST", f"/api/items/{iid}/images", raw=b"not an image")
         self.assertEqual(status, 400)
-        self.assertIsNone(self.json("DELETE", f"/api/items/{item['id']}/image")["image_url"])
+        self.json("DELETE", f"/api/items/{iid}/images/{images[0]['id']}")
+        item = self.json("DELETE", f"/api/items/{iid}/images/{images[1]['id']}")
+        self.assertIsNone(item["image_url"])
+        self.assertEqual(self.request("DELETE", f"/api/items/{iid}/images/{images[1]['id']}")[0], 404)
 
     def test_csv_round_trip(self):
         csv_text = ("Part_Number,Description,Category,Location,Quantity,Unit_Value\n"
@@ -488,7 +536,7 @@ class AuthTests(ServerTestCase):
 
     def test_backup_zip(self):
         item = self.json("POST", "/api/items", {"part_number": "P1"}, 201)
-        self.request("POST", f"/api/items/{item['id']}/image", raw=PNG)
+        self.request("POST", f"/api/items/{item['id']}/images", raw=PNG)
         with self.opener.open(urllib.request.Request(self.base + "/api/backup.zip")) as res:
             self.assertEqual(res.headers["Content-Type"], "application/zip")
             zf = zipfile.ZipFile(io.BytesIO(res.read()))
@@ -546,6 +594,105 @@ class BehindProxyTests(ServerTestCase):
             self.assertEqual(login("198.51.100.1", "wrong"), 401)
         self.assertEqual(login("198.51.100.1", "longenough"), 429)
         self.assertEqual(login("198.51.100.2", "longenough"), 200)
+
+
+class VersionTests(unittest.TestCase):
+    def make_checkout(self, tmp, head="ref: refs/heads/main\n", packed=False):
+        git = Path(tmp, ".git")
+        (git / "refs" / "heads").mkdir(parents=True)
+        (git / "HEAD").write_text(head)
+        if packed:
+            (git / "packed-refs").write_text("# pack-refs with: peeled\nabc123 refs/heads/main\n")
+        else:
+            (git / "refs" / "heads" / "main").write_text("abc123\n")
+        (git / "config").write_text('[core]\n\tbare = false\n[remote "origin"]\n'
+                                    '\turl = https://github.com/Someone/Inventory.git\n\tfetch = +refs/heads/*\n')
+        return Path(tmp)
+
+    def test_reads_local_version_and_repo(self):
+        from inventory.version import github_repo, local_version
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_checkout(tmp)
+            self.assertEqual(local_version(app), {"commit": "abc123", "branch": "main"})
+            self.assertEqual(github_repo(app), "Someone/Inventory")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(local_version(self.make_checkout(tmp, packed=True))["commit"], "abc123")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(local_version(Path(tmp)), {"commit": None, "branch": None})
+
+    def test_checker(self):
+        from inventory.version import UpdateChecker
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            return {"status": "ahead", "ahead_by": 2, "commits": [
+                {"sha": "def1", "commit": {"message": "Add photos\n\nlong text", "committer": {"date": "2026-10-01T00:00:00Z"}}},
+                {"sha": "def2", "commit": {"message": "Fix labels", "committer": {"date": "2026-10-02T00:00:00Z"}}},
+            ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = UpdateChecker(self.make_checkout(tmp), fetch=fetch)
+            result = checker.check()
+            self.assertEqual(calls, ["https://api.github.com/repos/Someone/Inventory/compare/abc123...main"])
+            self.assertEqual((result["available"], result["behind_by"], result["latest"]), (True, 2, "def2"))
+            self.assertEqual([c["message"] for c in result["changes"]], ["Fix labels", "Add photos"])
+            checker.check()
+            self.assertEqual(len(calls), 1)  # cached
+            checker.check(force=True)
+            self.assertEqual(len(calls), 2)
+
+            checker = UpdateChecker(Path(tmp), fetch=lambda url: {"status": "identical", "ahead_by": 0, "commits": []})
+            self.assertFalse(checker.check()["available"])
+
+            def offline(url):
+                raise urllib.error.URLError("no network")
+            with self.assertRaises(RuntimeError):
+                UpdateChecker(Path(tmp), fetch=offline).check()
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(RuntimeError):
+            UpdateChecker(Path(tmp), fetch=fetch).check()  # not a git checkout
+
+
+class FakeChecker:
+    def check(self, force=False):
+        return {"available": True, "behind_by": 1, "latest": "zzz", "changes": [{"message": "New", "date": None}]}
+
+
+class UpdateApiTests(ServerTestCase):
+    def setUp(self):
+        self.trigger_dir = tempfile.TemporaryDirectory()
+        self.trigger = Path(self.trigger_dir.name, "update-requested")
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        self.trigger_dir.cleanup()
+
+    def test_update_flow(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = make_server("127.0.0.1", 0, ":memory:", self.tmp.name,
+                                  update_trigger=str(self.trigger), checker=FakeChecker())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.store.set_password("tester", "password123")
+        self.json("POST", "/api/login", {"username": "tester", "password": "password123"})
+
+        version = self.json("GET", "/api/version")
+        self.assertEqual((version["can_update"], version["update_pending"]), (True, False))
+        self.assertEqual(self.json("GET", "/api/updates")["changes"][0]["message"], "New")
+        self.json("POST", "/api/updates/install", expect=202)
+        self.assertIn("Requested by tester", self.trigger.read_text())
+        self.assertTrue(self.json("GET", "/api/version")["update_pending"])
+        Path(self.trigger_dir.name, "update.log").write_text("=== update started\n=== update finished\n")
+        self.assertEqual(self.json("GET", "/api/updates/log")["lines"][-1], "=== update finished")
+        self.assertEqual(self.request("POST", "/api/updates/install", opener=self.new_browser())[0], 401)
+
+    def test_without_updater_installed(self):
+        self.assertFalse(self.json("GET", "/api/version")["can_update"])
+        status, body = self.request("POST", "/api/updates/install")
+        self.assertEqual(status, 400)
+        self.assertIn("git pull", body)
+        self.assertEqual(self.json("GET", "/api/updates/log"), {"lines": []})
 
 
 if __name__ == "__main__":

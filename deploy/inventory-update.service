@@ -1,0 +1,6 @@
+[Unit]
+Description=Update the inventory tracker (requested from the app)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash @APP_DIR@/deploy/run-update.sh

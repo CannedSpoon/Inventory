@@ -2,8 +2,10 @@
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
-const money = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" });
-const number = new Intl.NumberFormat();
+// Australian dollars, with Australian number and date formats.
+const LOCALE = "en-AU";
+const money = new Intl.NumberFormat(LOCALE, { style: "currency", currency: "AUD" });
+const number = new Intl.NumberFormat(LOCALE);
 
 const state = {
   view: "parts",
@@ -47,7 +49,7 @@ function highlight(text, q) {
 
 function when(utc, withTime = true) {
   const d = new Date(utc.replace(" ", "T") + "Z");
-  return withTime ? d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : d.toLocaleDateString();
+  return withTime ? d.toLocaleString(LOCALE, { dateStyle: "medium", timeStyle: "short" }) : d.toLocaleDateString(LOCALE);
 }
 
 function signed(n) {
@@ -117,7 +119,7 @@ async function loadLookups() {
 }
 
 function loadView() {
-  return { parts: loadParts, jobs: loadJobs, locations: loadLocations, history: loadHistory }[state.view]();
+  return { parts: loadParts, jobs: loadJobs, locations: loadLocations, history: loadHistory, help: async () => {} }[state.view]();
 }
 
 function setEmpty(id, show, text) {
@@ -452,7 +454,7 @@ function partForm(item) {
     { name: "description", label: "Description", type: "textarea", value: item?.description },
     { name: "category", label: "Category", list: "dl-categories", value: item?.category,
       placeholder: "e.g. Resistors, Fasteners", hint: "Pick one, or type a new category." },
-    { name: "unit_value", label: "Unit value ($)", type: "number", min: 0, step: "0.01", value: item?.unit_value ?? 0, required: true },
+    { name: "unit_value", label: "Unit value (AUD $)", type: "number", min: 0, step: "0.01", value: item?.unit_value ?? 0, required: true },
   ];
   if (!item) {
     fields.push(
@@ -579,19 +581,36 @@ async function stockDialog(mode, item, preset = {}) {
 
 async function openPart(id) {
   const dlg = $("#detail-dialog");
-  const render = async () => {
-    const [item, history] = await Promise.all([api("GET", `/api/items/${id}`), api("GET", `/api/items/${id}/history`)]);
+  let selected = null; // id of the photo being shown
+  let loaded = null;
+  const render = async (reuse = false) => {
+    if (!reuse || !loaded) loaded = await Promise.all([api("GET", `/api/items/${id}`), api("GET", `/api/items/${id}/history`)]);
+    const [item, history] = loaded;
+    const images = item.images;
+    if (!images.some((im) => im.id === selected)) selected = images[0]?.id ?? null;
+    const shown = images.find((im) => im.id === selected);
     dlg.innerHTML = `
       <div class="detail">
         <button class="close" data-act="close" aria-label="Close">✕</button>
         <div class="detail-head">
           <div class="photo">
-            ${item.image_url
-              ? `<a href="${esc(item.image_url)}" target="_blank" rel="noopener"><img src="${esc(item.image_url)}" alt="Picture of ${esc(item.part_number)}"></a>`
-              : `<div class="no-photo">No picture</div>`}
+            ${shown
+              ? `<a class="photo-main" href="${esc(shown.url)}" target="_blank" rel="noopener" title="Open full size">
+                   <img src="${esc(shown.url)}" alt="Photo of ${esc(item.part_number)}"></a>`
+              : `<div class="no-photo">No photos</div>`}
+            ${images.length > 1
+              ? `<div class="photo-strip">${images
+                  .map(
+                    (im, i) => `<button type="button" class="photo-thumb${im.id === selected ? " selected" : ""}" data-img="${im.id}"
+                       title="${i === 0 ? "Main photo" : "Show this photo"}"><img src="${esc(im.url)}" alt="" loading="lazy">${i === 0 ? "<span>Main</span>" : ""}</button>`
+                  )
+                  .join("")}</div>`
+              : ""}
+            <p class="photo-status muted small" hidden></p>
             <div class="photo-actions">
-              <button data-act="upload">${item.image_url ? "Change picture" : "Add picture"}</button>
-              ${item.image_url ? `<button data-act="remove-image">Remove</button>` : ""}
+              <button data-act="upload">+ Add photos</button>
+              ${shown && images[0].id !== shown.id ? `<button data-act="main-image">Make main</button>` : ""}
+              ${shown ? `<button data-act="remove-image">Remove</button>` : ""}
             </div>
           </div>
           <div class="info">
@@ -641,6 +660,11 @@ async function openPart(id) {
       </div>`;
 
     dlg.onclick = async (e) => {
+      const thumbBtn = e.target.closest("[data-img]");
+      if (thumbBtn) {
+        selected = Number(thumbBtn.dataset.img);
+        return render(true);
+      }
       const act = e.target.closest("button")?.dataset.act;
       if (!act) return;
       const loc = e.target.closest("tr")?.dataset.loc;
@@ -649,10 +673,14 @@ async function openPart(id) {
         else if (STOCK_ACTIONS[act]) stockDialog(act, item, { location: loc });
         else if (act === "edit") partForm(item);
         else if (act === "label") labelDialog("parts", [partLabel(item)]);
-        else if (act === "upload") pickImage(item);
-        else if (act === "remove-image") {
-          if (!confirm("Remove this picture?")) return;
-          await api("DELETE", `/api/items/${item.id}/image`);
+        else if (act === "upload") pickImages(item, $(".photo-status", dlg));
+        else if (act === "main-image") {
+          await api("POST", `/api/items/${item.id}/images/${selected}/main`);
+          refresh();
+        } else if (act === "remove-image") {
+          if (!confirm("Remove this photo?")) return;
+          await api("DELETE", `/api/items/${item.id}/images/${selected}`);
+          selected = null;
           refresh();
         } else if (act === "delete") {
           if (!confirm(`Delete ${item.part_number}? Its stock records are removed; job history is kept.`)) return;
@@ -691,23 +719,37 @@ $("#detail-dialog").addEventListener("click", (e) => {
 
 let imageTarget = null;
 
-function pickImage(item) {
-  imageTarget = item;
+function pickImages(item, statusEl) {
+  imageTarget = { item, statusEl };
   $("#image-file").click();
 }
 
 $("#image-file").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
+  const files = [...e.target.files];
   e.target.value = "";
-  if (!file || !imageTarget) return;
-  try {
-    const blob = await shrinkImage(file);
-    await api("POST", `/api/items/${imageTarget.id}/image`, blob, blob.type || "application/octet-stream");
-    showMessage(`Picture saved for ${imageTarget.part_number}.`);
-    refresh();
-  } catch (err) {
-    showMessage(`Picture upload failed: ${err.message}`, true);
+  if (!files.length || !imageTarget) return;
+  const { item, statusEl } = imageTarget;
+  const status = (text, isError = false) => {
+    if (!statusEl?.isConnected) return showMessage(text, isError);
+    statusEl.textContent = text;
+    statusEl.classList.toggle("error", isError);
+    statusEl.hidden = false;
+  };
+  let added = 0;
+  const failed = [];
+  for (const [i, file] of files.entries()) {
+    status(files.length > 1 ? `Uploading photo ${i + 1} of ${files.length}…` : "Uploading photo…");
+    try {
+      const blob = await shrinkImage(file);
+      await api("POST", `/api/items/${item.id}/images`, blob, blob.type || "application/octet-stream");
+      added++;
+    } catch (err) {
+      failed.push(`${file.name}: ${err.message}`);
+    }
   }
+  await refresh(); // re-renders the details, which hides the status line
+  if (failed.length) showMessage(`Added ${added} photo${added === 1 ? "" : "s"}. Not added: ${failed.join("; ")}`, true);
+  else showMessage(`Added ${added} photo${added === 1 ? "" : "s"} to ${item.part_number}.`);
 });
 
 // Phone photos are large: scale down to 1600px and re-encode as JPEG before uploading.
@@ -1162,6 +1204,7 @@ function signedIn(user) {
   document.body.classList.remove("signed-out");
   $("#account-btn").textContent = user.username;
   setView();
+  backgroundUpdateCheck();
 }
 
 async function start() {
@@ -1200,6 +1243,8 @@ async function accountDialog() {
         )
         .join("")}</table>
       <div><button type="button" data-act="add-user">+ Add person</button></div>
+      <h3>Updates</h3>
+      <div class="update-box"><p class="muted">Checking for updates…</p></div>
       <h3>Change your password</h3>`,
     fields: [
       { name: "current", label: "Current password", type: "password", required: true },
@@ -1208,6 +1253,7 @@ async function accountDialog() {
     ],
     submitLabel: "Change password",
     setup: (form) => {
+      showUpdates($(".update-box", form));
       form.addEventListener("click", async (e) => {
         const btn = e.target.closest("button");
         if (!btn) return;
@@ -1217,6 +1263,10 @@ async function accountDialog() {
             showLogin();
           } else if (btn.dataset.act === "add-user") {
             addUserDialog();
+          } else if (btn.dataset.act === "check-updates") {
+            showUpdates($(".update-box", form), true);
+          } else if (btn.dataset.act === "install-update") {
+            installUpdate($(".update-box", form));
           } else if (btn.dataset.remove) {
             if (!confirm(`Remove ${btn.dataset.name}? They won't be able to sign in any more.`)) return;
             await api("DELETE", `/api/users/${btn.dataset.remove}`);
@@ -1254,6 +1304,105 @@ function addUserDialog() {
 
 $("#account-btn").addEventListener("click", () => accountDialog().catch((err) => showMessage(err.message, true)));
 
+// --- updates -----------------------------------------------------------------
+
+// Fill box with the running version and what's new on GitHub.
+async function showUpdates(box, force = false) {
+  box.innerHTML = `<p class="muted">Checking for updates…</p>`;
+  let version, updates;
+  try {
+    version = await api("GET", "/api/version");
+    updates = await api("GET", `/api/updates${force ? "?force=1" : ""}`);
+  } catch (err) {
+    box.innerHTML = `<p class="muted">Version ${esc(version?.short || "unknown")}.</p>
+      <p class="error">${esc(err.message)}</p>
+      <button type="button" data-act="check-updates">Try again</button>`;
+    return;
+  }
+  markUpdateAvailable(updates.available);
+  if (!updates.available) {
+    box.innerHTML = `<p>✓ You're up to date <span class="muted">(version ${esc(version.short)})</span>.</p>
+      <button type="button" data-act="check-updates">Check again</button>`;
+    return;
+  }
+  const changes = updates.changes
+    .map((c) => `<li>${esc(c.message)}${c.date ? ` <span class="muted">(${when(c.date.replace("T", " ").replace("Z", ""), false)})</span>` : ""}</li>`)
+    .join("");
+  box.innerHTML = `
+    <p><b>An update is available</b> <span class="muted">(${updates.behind_by} change${updates.behind_by === 1 ? "" : "s"}; you have version ${esc(version.short)})</span>.</p>
+    <ul class="changes">${changes}</ul>
+    ${version.can_update
+      ? `<button type="button" class="primary" data-act="install-update">Update now</button>
+         <p class="muted small">Your data is backed up first. The app restarts and is unavailable for about a minute.</p>`
+      : `<p class="muted small">This copy isn't set up for one-tap updates. In the app's folder, run
+         <code>git pull</code> and then restart the app. On a server installed with the setup script, run
+         <code>sudo bash /opt/inventory/deploy/update.sh</code> once to turn on one-tap updates.</p>`}`;
+}
+
+async function installUpdate(box) {
+  if (!confirm("Update now? The app restarts and will be unavailable for about a minute.")) return;
+  const before = (await api("GET", "/api/version")).commit;
+  await api("POST", "/api/updates/install");
+  box.innerHTML = `<p><b>Updating…</b> This page reloads by itself when it's done. Please don't close it.</p>`;
+  const started = Date.now();
+  while (Date.now() - started < 4 * 60 * 1000) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      const now = await (await fetch("/api/version", { headers: { "X-Requested-With": "inventory" } })).json();
+      if (now.commit && now.commit !== before) {
+        box.innerHTML = `<p><b>Updated!</b> Reloading…</p>`;
+        setTimeout(() => location.reload(), 800);
+        return;
+      }
+      if (!now.update_pending) {
+        // The updater ran but the version didn't change: show why.
+        const { lines } = await api("GET", "/api/updates/log");
+        const start = lines.map((l) => l.includes("update started")).lastIndexOf(true);
+        const run = start === -1 ? [] : lines.slice(start);
+        if (run.some((l) => l.includes("UPDATE FAILED") || l.includes("update finished"))) {
+          box.innerHTML = `<p class="error"><b>The update didn't complete.</b> Your data wasn't changed. Details from the server:</p>
+            <pre class="log">${esc(run.slice(-25).join("\n"))}</pre>`;
+          return;
+        }
+      }
+    } catch {
+      // the app is restarting; keep waiting
+    }
+  }
+  const { lines } = await api("GET", "/api/updates/log").catch(() => ({ lines: [] }));
+  box.innerHTML = `<p class="error"><b>The update is taking longer than expected.</b> Try reloading the page in a minute.</p>
+    ${lines.length ? `<pre class="log">${esc(lines.slice(-25).join("\n"))}</pre>` : ""}`;
+}
+
+function markUpdateAvailable(available) {
+  $("#account-btn").classList.toggle("has-update", !!available);
+  $("#account-btn").title = available ? "An update is available" : "Account, users, backup and updates";
+}
+
+// Check quietly once after signing in; GitHub is asked at most every 10 minutes (server cache).
+async function backgroundUpdateCheck() {
+  try {
+    const updates = await api("GET", "/api/updates");
+    markUpdateAvailable(updates.available);
+  } catch {
+    // offline or not installed from GitHub: nothing to show
+  }
+}
+
+// --- help --------------------------------------------------------------------
+
+$("#help-search").addEventListener("input", (e) => {
+  const words = e.target.value.toLowerCase().split(/\s+/).filter(Boolean);
+  let shown = 0;
+  $$("#view-help details").forEach((d) => {
+    const match = words.every((w) => d.textContent.toLowerCase().includes(w));
+    d.hidden = !match;
+    d.open = match && words.length > 0;
+    shown += match;
+  });
+  $("#view-help .help-empty").hidden = shown > 0;
+});
+
 // --- navigation ------------------------------------------------------------
 
 function setView() {
@@ -1266,7 +1415,7 @@ function setView() {
     view = state.view;
     scan(code).catch((err) => showMessage(err.message, true));
   }
-  state.view = ["parts", "jobs", "locations", "history"].includes(view) ? view : "parts";
+  state.view = ["parts", "jobs", "locations", "history", "help"].includes(view) ? view : "parts";
   $$(".view").forEach((s) => (s.hidden = s.id !== `view-${state.view}`));
   $$(".tabs button").forEach((b) => b.setAttribute("aria-selected", b.dataset.view === state.view));
   refresh();

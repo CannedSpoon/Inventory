@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .store import SESSION_DAYS, NotFound, Store, ValidationError
+from .version import UpdateChecker, local_version
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 CSV_FIELDS = ["part_number", "description", "category", "location", "quantity", "unit_value", "total_value"]
@@ -50,14 +51,19 @@ ROUTES = [
     ("DELETE", r"/api/users/(\d+)", "delete_user"),
     ("POST", r"/api/password", "change_password"),
     ("GET", r"/api/backup\.zip", "backup"),
+    ("GET", r"/api/version", "version"),
+    ("GET", r"/api/updates", "check_updates"),
+    ("POST", r"/api/updates/install", "install_update"),
+    ("GET", r"/api/updates/log", "update_log"),
     ("GET", r"/api/items", "list_items"),
     ("POST", r"/api/items", "create_item"),
     ("GET", r"/api/items/(\d+)", "get_item"),
     ("PUT", r"/api/items/(\d+)", "update_item"),
     ("DELETE", r"/api/items/(\d+)", "delete_item"),
     ("GET", r"/api/items/(\d+)/history", "item_history"),
-    ("POST", r"/api/items/(\d+)/image", "upload_image"),
-    ("DELETE", r"/api/items/(\d+)/image", "delete_image"),
+    ("POST", r"/api/items/(\d+)/images", "upload_image"),
+    ("DELETE", r"/api/items/(\d+)/images/(\d+)", "delete_image"),
+    ("POST", r"/api/items/(\d+)/images/(\d+)/main", "main_image"),
     ("POST", r"/api/items/(\d+)/(receive|book-out|return|transfer|count)", "stock_action"),
     ("GET", r"/api/locations", "list_locations"),
     ("POST", r"/api/locations", "create_location"),
@@ -136,8 +142,10 @@ def to_csv(fields, rows):
     return buf.getvalue()
 
 
-def make_handler(store, behind_proxy=False):
+def make_handler(store, behind_proxy=False, update_trigger=None, checker=None):
     limiter = LoginLimiter()
+    checker = checker or UpdateChecker()
+    update_trigger = Path(update_trigger) if update_trigger else None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -314,6 +322,33 @@ def make_handler(store, behind_proxy=False):
                 self.end_headers()
                 shutil.copyfileobj(f, self.wfile)
 
+        # --- updates -----------------------------------------------------
+        def version(self):
+            v = local_version()
+            self.send(HTTPStatus.OK, {**v, "short": (v["commit"] or "")[:7] or None,
+                                      "can_update": update_trigger is not None,
+                                      "update_pending": bool(update_trigger and update_trigger.exists())})
+
+        def check_updates(self):
+            try:
+                result = checker.check(force=self.query.get("force") == "1")
+            except RuntimeError as e:
+                return self.error(HTTPStatus.BAD_GATEWAY, str(e))
+            self.send(HTTPStatus.OK, result)
+
+        def install_update(self):
+            if not update_trigger:
+                raise ValidationError("Updating from the app is only set up on servers installed with deploy/setup.sh. "
+                                      "On this computer, run: git pull, then restart the app.")
+            # The root-owned updater service watches for this file; the app itself can't change its code.
+            update_trigger.write_text(f"Requested by {self.user['username']} at {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+            self.send(HTTPStatus.ACCEPTED, {"requested": True})
+
+        def update_log(self):
+            log = update_trigger.parent / "update.log" if update_trigger else None
+            lines = log.read_text(errors="replace").splitlines()[-60:] if log and log.is_file() else []
+            self.send(HTTPStatus.OK, {"lines": lines})
+
         # --- parts -------------------------------------------------------
         def list_items(self):
             q = self.query
@@ -344,10 +379,13 @@ def make_handler(store, behind_proxy=False):
             self.send(HTTPStatus.OK, store.history(item_id=item_id))
 
         def upload_image(self, item_id):
-            self.send(HTTPStatus.OK, store.set_image(item_id, self.body()))
+            self.send(HTTPStatus.OK, store.add_image(item_id, self.body()))
 
-        def delete_image(self, item_id):
-            self.send(HTTPStatus.OK, store.remove_image(item_id))
+        def delete_image(self, item_id, image_id):
+            self.send(HTTPStatus.OK, store.remove_image(item_id, image_id))
+
+        def main_image(self, item_id, image_id):
+            self.send(HTTPStatus.OK, store.make_main_image(item_id, image_id))
 
         def stock_action(self, item_id, action):
             self.send(HTTPStatus.OK, getattr(store, STOCK_ACTIONS[action])(item_id, self.json_body()))
@@ -470,9 +508,10 @@ def make_handler(store, behind_proxy=False):
     return Handler
 
 
-def make_server(host="127.0.0.1", port=8000, db="inventory.db", uploads=None, behind_proxy=False):
+def make_server(host="127.0.0.1", port=8000, db="inventory.db", uploads=None, behind_proxy=False,
+                update_trigger=None, checker=None):
     store = Store(db, uploads)
-    server = ThreadingHTTPServer((host, port), make_handler(store, behind_proxy))
+    server = ThreadingHTTPServer((host, port), make_handler(store, behind_proxy, update_trigger, checker))
     server.store = store
     return server
 
@@ -507,6 +546,8 @@ def main():
     parser.add_argument("--uploads", help="Folder for part pictures (default: 'uploads' next to the database)")
     parser.add_argument("--behind-proxy", action="store_true",
                         help="Running behind a reverse proxy such as Caddy: trust its X-Forwarded-* headers")
+    parser.add_argument("--update-trigger", metavar="FILE",
+                        help="Let signed-in users request an update: the app creates FILE for a separate updater to act on")
     parser.add_argument("--set-password", metavar="USERNAME",
                         help="Create a user, or reset their password, then exit")
     parser.add_argument("--backup", metavar="FOLDER", help="Write a backup zip to FOLDER, then exit")
@@ -519,7 +560,7 @@ def main():
         if args.backup:
             backup_cli(store, args.backup, max(args.keep, 1))
         return
-    server = make_server(args.host, args.port, args.db, args.uploads, args.behind_proxy)
+    server = make_server(args.host, args.port, args.db, args.uploads, args.behind_proxy, args.update_trigger)
     print(f"Inventory running at http://{args.host}:{args.port}  (database: {args.db})")
     if not server.store.user_count():
         print(f"No accounts yet: open http://127.0.0.1:{args.port} on this computer to create one,")

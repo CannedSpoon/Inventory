@@ -92,13 +92,18 @@ If you've been running the app on your own computer:
 
 ## Updating to a new version
 
-Open the SSH window and run:
+In the app, tap **your name**. A dot on it means an update is available. Under **Updates**, tap
+**Update now**. The server backs up your data, downloads the new version and restarts. The page reloads
+itself after about a minute.
+
+If you set up the server before the **Update now** button existed, turn it on by running this once in
+the SSH window. It's also the way to update by hand:
 
 ```bash
 sudo bash /opt/inventory/deploy/update.sh
 ```
 
-It backs up first, downloads the latest version and restarts the app.
+If an update fails, the app shows the error. The full log is in `/var/lib/inventory/update.log`.
 
 ## Forgotten password
 

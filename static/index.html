@@ -38,6 +38,7 @@
     <button role="tab" data-view="jobs">Jobs</button>
     <button role="tab" data-view="locations">Locations</button>
     <button role="tab" data-view="history">History</button>
+    <button role="tab" data-view="help">Help</button>
   </nav>
 
   <main>
@@ -134,6 +135,161 @@
         <p class="empty" id="history-empty" hidden></p>
       </div>
     </section>
+    <section id="view-help" class="view" hidden>
+      <div class="toolbar">
+        <input class="search" id="help-search" type="search" placeholder="Search help…" autocomplete="off">
+      </div>
+      <div class="help">
+        <p class="help-intro">Tap a topic to open it. All values are in Australian dollars (AUD).</p>
+
+        <details>
+          <summary>Getting started</summary>
+          <ol>
+            <li><b>Add your locations</b>: the places parts are kept, such as a shelf, a tote, a bin or a van. Go to <b>Locations › + Add location</b>, or just type a new location name the first time you add stock.</li>
+            <li><b>Add a part</b>: <b>Parts › + Add part</b>. Enter the P/N (part number), a description, a category and the unit value. You can enter a starting quantity and where it's kept.</li>
+            <li><b>Print labels</b> for your locations (see <i>Labels and printing</i>) and stick them on.</li>
+            <li>From then on, <b>scan a label</b> to see what's in it, and use <b>Book out</b> whenever parts go to a job.</li>
+          </ol>
+        </details>
+
+        <details>
+          <summary>Finding parts</summary>
+          <ul>
+            <li>Type in the search box on the Parts tab. It searches the P/N, description, category and location names as you type. Every word must match, so <i>resistor 10k</i> finds parts containing both words.</li>
+            <li>Use the <b>category</b> and <b>location</b> drop-downs to narrow the list.</li>
+            <li>Tap a column heading (P/N, Qty, Value…) to sort; tap again to reverse.</li>
+            <li>On a computer, press <kbd>/</kbd> to jump to the search box.</li>
+            <li>A quantity in <span class="low">red</span> means none are in stock.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Parts, photos and categories</summary>
+          <ul>
+            <li>Tap a part to open it. You'll see its photos, how many are at each location, and everything that's happened to it.</li>
+            <li><b>Photos:</b> tap <b>+ Add photos</b>. On a phone you can take a photo or choose several from your gallery. Tap a small photo to view it, and <b>Make main</b> to use it as the part's picture in lists. Tap the large photo to open it full size. Each part can have up to 20 photos.</li>
+            <li><b>Categories</b> group similar parts (e.g. Resistors, Fasteners). Set one with <b>Edit</b>: pick an existing category or type a new one.</li>
+            <li><b>Edit</b> changes the P/N, description, category or value. Changing the value doesn't change the value of parts already booked to jobs.</li>
+            <li><b>Delete</b> removes the part and its stock. Jobs it was booked to keep their record of it.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Receiving, booking out, moving and counting stock</summary>
+          <ul>
+            <li><b>Receive</b>: new stock has arrived. Choose the location, or type a new location name to create it.</li>
+            <li><b>Book out</b>: parts are going to a job. Choose which location they come from and the job. Type a new job number to create the job. You can't book out more than that location has.</li>
+            <li><b>Move</b>: parts moved from one location to another.</li>
+            <li><b>Count</b>: after a stocktake, enter how many are actually there and the quantity is corrected.</li>
+            <li><b>Return</b>: unused parts come back from a job. Open the job and tap <b>Return</b> next to the part.</li>
+            <li>Add a <b>note</b> to any of these; it shows in the history.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Locations and containers</summary>
+          <ul>
+            <li>Tap a location (or scan its label) to see <b>everything in it</b>, with quantities and value. You can book out, move, or <b>Add stock here</b> from that screen.</li>
+            <li>Each location has a <b>label code</b> such as <code>LOC-0003</code>. You can change it with <b>Edit</b> (e.g. to match labels you already have), but then reprint the label.</li>
+            <li>A location can only be deleted when it's empty.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Jobs</summary>
+          <ul>
+            <li>The <b>Jobs</b> tab lists jobs with the parts booked to them and their total value.</li>
+            <li>Open a job to see its parts, <b>Book part out</b> to it, <b>Return</b> unused parts, or <b>Export CSV</b> (e.g. for invoicing).</li>
+            <li>Values are fixed at the time parts are booked out.</li>
+            <li><b>Close job</b> when it's finished; closed jobs can't have more parts booked to them. You can reopen a job.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Labels and printing (Brother P-touch)</summary>
+          <ul>
+            <li>Tap <b>Print label</b> on a location or part, or <b>Print labels</b> on the Locations or Parts tab to do several at once (untick the ones you don't want).</li>
+            <li>Choose your <b>tape width</b> and the <b>code type</b>:
+              <ul>
+                <li><b>QR code</b> (recommended): scan with a phone's camera.</li>
+                <li><b>Barcode (Code 128)</b>: for handheld scanners that can't read QR codes.</li>
+              </ul>
+            </li>
+            <li><b>Print</b> sends the labels to a P-touch connected to a computer. In the print window, set margins to <i>None</i> and scale to 100%.</li>
+            <li><b>Download PNG</b> saves label images you can print from P-touch Editor (<i>Insert › Picture</i>) or Brother's apps.</li>
+            <li><b>P-touch Editor CSV</b> exports label data for P-touch Editor's database merge.</li>
+            <li>Phones can't usually print straight to a P-touch from a web browser. Print labels from a computer, or download the PNG on your phone.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Scanning labels</summary>
+          <ul>
+            <li><b>Phone:</b> open your camera app and point it at a QR label, then tap the link that appears. The app opens on that location. Sign in first if asked.</li>
+            <li><b>Handheld barcode scanner</b> (USB or Bluetooth): just scan while the app is open; you don't need to click anything first.</li>
+            <li><b>Scan button:</b> type a location code, P/N or job number to jump straight to it.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>History</summary>
+          <ul>
+            <li>The <b>History</b> tab lists every stock change: when, what, where, which job, who did it, and any note.</li>
+            <li>Search it by P/N, job, location, person or note.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Importing and exporting (CSV / Excel)</summary>
+          <ul>
+            <li><b>Export CSV</b> on the Parts tab downloads a spreadsheet of stock: one row per part per location. It follows your current search and filters.</li>
+            <li><b>Import CSV</b> adds or updates parts from a spreadsheet saved as CSV. The first row must have column names; <code>part_number</code> is required, and <code>description</code>, <code>category</code>, <code>location</code>, <code>quantity</code> and <code>unit_value</code> are optional.</li>
+            <li>A quantity on import <i>sets</i> the count at that location (like a stocktake). Rows with problems are skipped and listed.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>People, passwords and backups</summary>
+          <ul>
+            <li>Tap <b>your name</b> (top right) for the account menu.</li>
+            <li><b>+ Add person</b> gives someone their own sign-in. <b>Remove</b> stops them signing in; their history stays.</li>
+            <li><b>Change your password</b> at the bottom of the menu. This signs you out on your other devices.</li>
+            <li><b>Download backup</b> saves a zip of all data and photos. The server also keeps daily backups, but keep your own copy somewhere else (e.g. Google Drive) every so often.</li>
+            <li><b>Forgotten password?</b> Nobody can look up a password, but whoever manages the server can set a new one (see the hosting guide).</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Updating the app</summary>
+          <ul>
+            <li>When a new version is available, a dot appears on <b>your name</b>. Open the menu to see what's changed under <b>Updates</b>.</li>
+            <li>Tap <b>Update now</b>. Your data is backed up first, the app restarts (about a minute), and the page reloads itself.</li>
+            <li>Updates never change your parts, stock, jobs or photos.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Using it on your phone</summary>
+          <ul>
+            <li>In your phone's browser menu, choose <b>Add to Home Screen</b>. The app then opens from an icon, like any other app.</li>
+            <li>Everything works on a phone: searching, booking out, taking photos and scanning labels.</li>
+          </ul>
+        </details>
+
+        <details>
+          <summary>Something's not working</summary>
+          <ul>
+            <li><b>"Please sign in" keeps appearing:</b> your sign-in expired (after 30 days) or your password was changed on another device. Sign in again.</li>
+            <li><b>"Too many failed sign-ins":</b> wait 15 minutes and try again.</li>
+            <li><b>A label won't scan:</b> make sure it's flat and well lit. Phone cameras read QR codes; for a handheld 1D scanner, print Code 128 labels.</li>
+            <li><b>A photo won't upload:</b> photos must be JPEG, PNG, GIF or WebP, up to 10 MB (phone photos are shrunk automatically).</li>
+            <li><b>Can't delete a location:</b> it still has stock. Move or book out the stock first.</li>
+            <li><b>The site won't load at all:</b> whoever manages the server can check it using the "If something doesn't work" section of the hosting guide.</li>
+          </ul>
+        </details>
+        <p class="help-empty muted" hidden>No help topics match your search.</p>
+      </div>
+    </section>
   </main>
 
   <!-- Part / job details; built by app.js -->
@@ -147,7 +303,7 @@
   <datalist id="dl-categories"></datalist>
   <!-- Filled with labels just before printing -->
   <div id="print-area"></div>
-  <input id="image-file" type="file" accept="image/*" hidden>
+  <input id="image-file" type="file" accept="image/*" multiple hidden>
 
   <script src="vendor/qrcode.js"></script>
   <script src="labels.js"></script>

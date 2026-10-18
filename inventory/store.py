@@ -19,9 +19,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_LOCATION = "Main"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGES_PER_PART = 20
 
 SORTABLE = {
     "part_number": "part_number COLLATE NOCASE",
@@ -134,6 +135,20 @@ CREATE TABLE sessions (
     expires_at TEXT NOT NULL
 );
 ALTER TABLE movements ADD COLUMN user_name TEXT NOT NULL DEFAULT '';
+"""
+
+# Version 5 allows several pictures per part; the first (lowest position) is the main one.
+MIGRATE_V5 = """
+CREATE TABLE images (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    filename   TEXT    NOT NULL,
+    position   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX images_item ON images(item_id, position);
+INSERT INTO images (item_id, filename) SELECT id, image FROM items WHERE image IS NOT NULL AND image != '';
+UPDATE items SET image = NULL;
 """
 
 SESSION_DAYS = 30
@@ -287,6 +302,8 @@ class Store:
             self.conn.executescript(f"BEGIN; {MIGRATE_V3} PRAGMA user_version = 3; COMMIT;")
         if version < 4:
             self.conn.executescript(f"BEGIN; {MIGRATE_V4} PRAGMA user_version = 4; COMMIT;")
+        if version < 5:
+            self.conn.executescript(f"BEGIN; {MIGRATE_V5} PRAGMA user_version = 5; COMMIT;")
 
     @contextmanager
     def tx(self):
@@ -327,11 +344,20 @@ class Store:
             stock.setdefault(s["item_id"], []).append(
                 {"location_id": s["location_id"], "name": s["name"], "quantity": s["quantity"]}
             )
+        images = {}
+        for img in self.conn.execute(
+            f"""SELECT id, item_id, filename FROM images WHERE item_id IN ({",".join("?" * len(ids))})
+                ORDER BY position, id""",
+            ids,
+        ):
+            images.setdefault(img["item_id"], []).append({"id": img["id"], "url": f"/uploads/{img['filename']}"})
         for item in items:
+            item.pop("image", None)  # superseded by the images table
+            item["images"] = images.get(item["id"], [])
+            item["image_url"] = item["images"][0]["url"] if item["images"] else None
             item["locations"] = stock.get(item["id"], [])
             item["quantity"] = sum(s["quantity"] for s in item["locations"])
             item["total_value"] = round(item["quantity"] * item["unit_value"], 2)
-            item["image_url"] = f"/uploads/{item['image']}" if item.get("image") else None
         return items
 
     def search(self, query="", sort="part_number", order="asc", location_id=None, category=None):
@@ -395,34 +421,55 @@ class Store:
 
     def delete(self, item_id):
         with self.tx():
-            image = self._item_row(item_id)["image"]
+            self._item_row(item_id)
+            files = [r["filename"] for r in self.conn.execute("SELECT filename FROM images WHERE item_id = ?", (item_id,))]
             self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
-        self._remove_file(image)
+        for name in files:
+            self._remove_file(name)
 
     # --- pictures ----------------------------------------------------------
 
-    def set_image(self, item_id, data):
+    def add_image(self, item_id, data):
+        """Add a picture to a part. The first picture added becomes the main one."""
         if len(data) > MAX_IMAGE_BYTES:
             raise ValidationError("Picture must be 10 MB or smaller")
         ext = _image_ext(data)
         if not ext:
             raise ValidationError("Picture must be a JPEG, PNG, GIF or WebP image")
         with self.tx():
-            old = self._item_row(item_id)["image"]
+            self._item_row(item_id)
+            count, last = self._one(
+                "SELECT COUNT(*), COALESCE(MAX(position), -1) FROM images WHERE item_id = ?", (item_id,)
+            )
+            if count >= MAX_IMAGES_PER_PART:
+                raise ValidationError(f"A part can have up to {MAX_IMAGES_PER_PART} pictures")
             self.uploads.mkdir(parents=True, exist_ok=True)
             name = f"{item_id}-{secrets.token_hex(8)}.{ext}"
             (self.uploads / name).write_bytes(data)
             self.conn.execute(
-                "UPDATE items SET image = ?, updated_at = datetime('now') WHERE id = ?", (name, item_id)
+                "INSERT INTO images (item_id, filename, position) VALUES (?, ?, ?)", (item_id, name, last + 1)
             )
-        self._remove_file(old)
+            self.conn.execute("UPDATE items SET updated_at = datetime('now') WHERE id = ?", (item_id,))
         return self.get(item_id)
 
-    def remove_image(self, item_id):
+    def _image_row(self, item_id, image_id):
+        row = self._one("SELECT * FROM images WHERE id = ? AND item_id = ?", (image_id, item_id))
+        if row is None:
+            raise NotFound(f"Picture {image_id} not found")
+        return row
+
+    def remove_image(self, item_id, image_id):
         with self.tx():
-            old = self._item_row(item_id)["image"]
-            self.conn.execute("UPDATE items SET image = NULL, updated_at = datetime('now') WHERE id = ?", (item_id,))
-        self._remove_file(old)
+            name = self._image_row(item_id, image_id)["filename"]
+            self.conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+        self._remove_file(name)
+        return self.get(item_id)
+
+    def make_main_image(self, item_id, image_id):
+        with self.tx():
+            self._image_row(item_id, image_id)
+            first = self._one("SELECT MIN(position) FROM images WHERE item_id = ?", (item_id,))[0]
+            self.conn.execute("UPDATE images SET position = ? WHERE id = ?", (first - 1, image_id))
         return self.get(item_id)
 
     def _remove_file(self, name):

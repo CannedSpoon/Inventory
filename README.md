@@ -2,19 +2,20 @@
 
 A searchable inventory tracking system for parts. It tracks where each part is kept, which jobs
 parts are booked out to, and what everything is worth. Print barcode labels for your containers on a
-Brother P-touch (such as the PT-E550W) and scan them to see what's inside.
+Brother P-touch (such as the PT-E550W) and scan them to see what's inside. Values are in Australian
+dollars (AUD), and the app has a built-in **Help** tab.
 
 ![Parts list](docs/screenshot.png)
 
 ## Features
 
 **Parts**
-- Each part has a **P/N** (part number), **description**, **category**, **unit value** and an optional **picture**.
+- Each part has a **P/N** (part number), **description**, **category**, **unit value** (AUD) and **photos**.
 - Stock is held in one or more **locations** (a shelf, a bin, a van…). The parts list shows how many are at each location, plus the total quantity and value.
 - **Search** as you type by P/N, description, category or location name. Every word must match, and matches are highlighted. Press `/` to jump to the search box.
 - **Filter** by category or location, and **sort** by any column.
 - **Categories:** pick an existing category or type a new one when adding or editing a part.
-- **Pictures:** upload a photo of a part. Phone photos are shrunk before uploading.
+- **Photos:** add up to 20 photos per part, several at a time. Choose which is the main photo shown in lists, and remove ones you don't want. Phone photos are shrunk before uploading.
 
 **Stock movements** (from a part's row, or by clicking a part to open its details)
 - **Receive:** add new stock to a location. Type a new location name to create it.
@@ -58,6 +59,20 @@ out or moved stock. Tap your name (top right) to:
 - After 10 wrong passwords from one address, sign-in is blocked for 15 minutes.
 - The very first account is created in the browser, but only on the computer running the app.
   Alternatively, run `python3 run.py --set-password YOUR_NAME`, which also resets a forgotten password.
+
+## Updates
+
+When a new version is available, a dot appears on your name. Open the menu, see what's changed under
+**Updates**, and tap **Update now**:
+
+1. The app asks a separate updater service on the server to update. The app itself can't change its own code.
+2. The updater backs up your data, downloads the new version from GitHub and restarts the app.
+3. The page reloads itself when it's done. If the update fails, the server's error is shown instead,
+   and your data is left as it was.
+
+One-tap updates are set up by `deploy/setup.sh`. On a server set up before this feature existed, run
+`sudo bash /opt/inventory/deploy/update.sh` once to turn them on. For a copy running on your own
+computer, run `git pull` and restart the app.
 
 ## Hosting online
 
@@ -170,7 +185,13 @@ the header `X-Requested-With: inventory`, which protects against forged cross-si
 | GET | `/api/items?q=&sort=&order=&location_id=&category=` | Search parts, with stock per location and summary totals (`category=__none__` for uncategorised) |
 | POST | `/api/items` | Create a part (`part_number`, `description`, `category`, `unit_value`, optional `quantity` + `location`) |
 | GET / PUT / DELETE | `/api/items/{id}` | Get, update or delete a part |
-| POST / DELETE | `/api/items/{id}/image` | Upload (raw image body: JPEG, PNG, GIF or WebP, max 10 MB) or remove the picture |
+| POST | `/api/items/{id}/images` | Add a photo (raw image body: JPEG, PNG, GIF or WebP, max 10 MB; up to 20 per part) |
+| DELETE | `/api/items/{id}/images/{image_id}` | Remove a photo |
+| POST | `/api/items/{id}/images/{image_id}/main` | Make a photo the main one |
+| GET | `/api/version` | Running version, and whether one-tap updates are set up |
+| GET | `/api/updates?force=1` | Whether GitHub has a newer version, and what changed (cached 10 minutes unless `force`) |
+| POST | `/api/updates/install` | Ask the server's updater to update now |
+| GET | `/api/updates/log` | The end of the updater's log |
 | POST | `/api/items/{id}/receive` | `{location, quantity, note}` |
 | POST | `/api/items/{id}/book-out` | `{location, job, quantity, note}` |
 | POST | `/api/items/{id}/return` | `{job, location, quantity, note}` |

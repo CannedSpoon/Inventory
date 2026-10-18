@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for "Update now" requests from the inventory app
+
+[Path]
+PathExists=/var/lib/inventory/update-requested
+Unit=inventory-update.service
+
+[Install]
+WantedBy=paths.target
